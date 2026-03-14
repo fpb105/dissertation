@@ -288,13 +288,12 @@ class World:
 
     def populate_teams(self):
         """
-        Spawn 50 infantry per team: 5 formations of 10 units each.
         Formations are spread evenly down the map vertically.
         Team False = left side, Team True = right side.
         """
-        num_formations = 5
-        units_per_formation = 10
-        half_height = 20
+        num_formations = 1
+        units_per_formation = 50
+        half_height = 40
 
         for i in range(num_formations):
             y_centre = int((i + 0.5) * self.height / num_formations)

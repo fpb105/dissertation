@@ -1,6 +1,6 @@
 import tkinter as tk
 import numpy as np
-from dissertation.model import World
+from model import World
 
 class WorldView:
     TERRAIN_COLORS = {

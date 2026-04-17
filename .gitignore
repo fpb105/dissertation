@@ -205,3 +205,31 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Reinforcement Learning (Stable-Baselines3 / Gymnasium)
+#  Trained model weights — SB3 saves policies as .zip archives
+*.zip
+
+#  TensorBoard training logs
+runs/
+tb_logs/
+tensorboard_logs/
+events.out.tfevents.*
+
+#  SB3 Monitor wrapper CSV logs
+*.monitor.csv
+
+#  General training output directories
+logs/
+training/
+results/
+
+#  Gymnasium RecordVideo wrapper output
+recordings/
+videos/
+
+#  Optuna hyperparameter tuning databases (used by rl_zoo3 etc.)
+*.db
+
+#  Weights & Biases experiment tracking
+wandb/

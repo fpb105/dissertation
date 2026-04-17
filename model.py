@@ -3,9 +3,34 @@ from __future__ import annotations
 import enum
 import numpy as np
 from scipy.signal import convolve2d
+from scipy.spatial import cKDTree
 import math
 from abc import ABC, abstractmethod
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Terrain constants
+# ──────────────────────────────────────────────────────────────────────
+
+class Terrain(enum.IntEnum):
+    PLAINS = 0
+    WATER  = 1
+    FOREST = 2
+
+
+TERRAIN_SPEED = {
+    Terrain.PLAINS: 1.0,
+    Terrain.WATER:  0.3,
+    Terrain.FOREST: 0.7,
+}
+
+FOREST_DETECTION_RANGE = 2.0
+HEIGHT_RANGE_BONUS_PER_LEVEL = 1
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Unit hierarchy
+# ──────────────────────────────────────────────────────────────────────
 
 class Unit(ABC):
     def __init__(self):
@@ -15,6 +40,7 @@ class Unit(ABC):
         self.damage: int = 0
         self.range: int = 0
         self.speed: float = 0.0
+        self.radius: float = 0.5
         self.team: bool = False
         self.destination: tuple[float, float] | None = None
 
@@ -51,36 +77,36 @@ class Unit(ABC):
     def is_dead(self) -> bool:
         return self.hp <= 0
 
-    def move(self, destination: tuple[float, float], tick_rate: int):
-        """
-        Step toward destination by (speed / tick_rate) units.
-        tick_rate is passed directly — Unit no longer needs a World reference.
-        """
+    def set_destination(self, x: float, y: float):
+        self.destination = (x, y)
+
+    def get_destination(self) -> tuple[float, float] | None:
+        return self.destination
+
+    # ── movement ──────────────────────────────────────────────────────
+
+    def move(self, destination: tuple[float, float], tick_rate: int,
+             speed_modifier: float = 1.0):
         dx = destination[0] - self.x
         dy = destination[1] - self.y
         dist = math.hypot(dx, dy)
         if dist > 0:
-            step = self.speed / tick_rate
+            step = (self.speed * speed_modifier) / tick_rate
             ratio = min(step / dist, 1.0)
             self.x += dx * ratio
             self.y += dy * ratio
 
-    def attack(self, target: Unit):
-        """
-        Deal damage to target. World reference removed — targeting logic
-        lives in Formation/World, not here.
-        """
-        target.set_hp(target.get_hp() - self.damage)
-
-    def on_tick(self, tick_rate: int):
-        """
-        Called each tick by Formation. Moves toward destination if one is set.
-        tick_rate passed directly instead of a World object.
-        """
+    def on_tick(self, tick_rate: int, speed_modifier: float = 1.0):
         if self.destination is not None:
-            self.move(self.destination, tick_rate)
-            if math.hypot(self.destination[0] - self.x, self.destination[1] - self.y) < 0.01:
+            self.move(self.destination, tick_rate, speed_modifier)
+            if math.hypot(self.destination[0] - self.x,
+                          self.destination[1] - self.y) < 0.01:
                 self.destination = None
+
+    # ── combat ────────────────────────────────────────────────────────
+
+    def attack(self, target: Unit):
+        target.set_hp(target.get_hp() - self.damage)
 
 
 class Infantry(Unit):
@@ -90,6 +116,7 @@ class Infantry(Unit):
         self.damage = 10
         self.range = 1
         self.speed = 1.0
+        self.radius = 0.5
 
 
 class Archer(Unit):
@@ -99,6 +126,7 @@ class Archer(Unit):
         self.damage = 15
         self.range = 3
         self.speed = 1.2
+        self.radius = 0.5
 
 
 class Cavalry(Unit):
@@ -108,7 +136,12 @@ class Cavalry(Unit):
         self.damage = 7
         self.range = 1
         self.speed = 3.0
+        self.radius = 0.7
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Formation
+# ──────────────────────────────────────────────────────────────────────
 
 class Formation:
     def __init__(self, units: list[Unit]):
@@ -119,11 +152,6 @@ class Formation:
         self.starboardy: float = 0.0
 
     def place_units(self):
-        """
-        Directly set each unit's (x, y) along the port-to-starboard line.
-        Uses parametric form so vertical lines don't cause division by zero:
-            P(t) = port + t * (starboard - port),  t in [0, 1]
-        """
         dx = self.starboardx - self.portx
         dy = self.starboardy - self.porty
         n = len(self.units)
@@ -135,10 +163,6 @@ class Formation:
     def move(self, portx: float, porty: float,
              starboardx: float, starboardy: float,
              tick_rate: int):
-        """
-        Order all units to step toward their new positions along the given line.
-        World reference replaced with tick_rate passed directly.
-        """
         dx = starboardx - portx
         dy = starboardy - porty
         n = len(self.units)
@@ -149,7 +173,6 @@ class Formation:
             unit.move((target_x, target_y), tick_rate)
 
     def on_tick(self, tick_rate: int):
-        """Called by World.tick() — propagates tick down to each unit."""
         for unit in self.units:
             unit.on_tick(tick_rate)
 
@@ -159,7 +182,8 @@ class Formation:
     def get_living_units(self) -> list[Unit]:
         return [u for u in self.units if not u.is_dead()]
 
-    def get_units_around_point(self, x: float, y: float, radius: float) -> list[Unit]:
+    def get_units_around_point(self, x: float, y: float,
+                               radius: float) -> list[Unit]:
         return [u for u in self.units
                 if math.hypot(u.get_x() - x, u.get_y() - y) <= radius]
 
@@ -186,21 +210,52 @@ class Formation:
         return (self.starboardx, self.starboardy)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Team
+# ──────────────────────────────────────────────────────────────────────
+
+UNIT_TYPES = {
+    "infantry": Infantry,
+    "archer":   Archer,
+    "cavalry":  Cavalry,
+}
+
+
+class Team:
+    def __init__(self, team_id: bool):
+        self.team_id = team_id
+        self.formations: list[Formation] = []
+
+    def add_formation(self, formation: Formation):
+        self.formations.append(formation)
+
+    def get_formations(self) -> list[Formation]:
+        return self.formations
+
+    def get_all_units(self) -> list[Unit]:
+        return [u for f in self.formations for u in f.get_units()]
+
+    def get_living_units(self) -> list[Unit]:
+        return [u for f in self.formations for u in f.get_living_units()]
+
+    def is_defeated(self) -> bool:
+        return len(self.get_living_units()) == 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# World — terrain-aware with curriculum gating
+# ──────────────────────────────────────────────────────────────────────
+
 class World:
 
-    class Units(enum.IntEnum):
-        Infantry = 10
-        Archer = 11
-        Cavalry = 12
-
-    def __init__(self, width: int, height: int, tick_rate: int):
+    def __init__(self, width: int, height: int, tick_rate: int,
+                 curriculum_stage: int = 0):
         self.width = width
         self.height = height
         self.tick_rate = tick_rate
-        # Plain data attributes first — if terrain generation throws,
-        # the object isn't left in a half-constructed state without these.
-        self.units: list[Unit] = []
-        self.formations: list[Formation] = []
+        self.curriculum_stage = curriculum_stage
+
+        self.teams: list[Team] = []
         self.terrain_map = self._generate_terrain_map()
         self.height_map = self._generate_height_map()
         self.tiles = np.stack(
@@ -209,12 +264,366 @@ class World:
             axis=-1
         )
 
-    # ------------------------------------------------------------------
-    # Terrain generation (unchanged)
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Team management
+    # ==================================================================
+
+    def add_team(self, team: Team):
+        self.teams.append(team)
+
+    def remove_team(self, team: Team):
+        self.teams.remove(team)
+
+    def get_teams(self) -> list[Team]:
+        return self.teams
+
+    def get_all_units(self) -> list[Unit]:
+        return [u for team in self.teams
+                for f in team.get_formations()
+                for u in f.get_units()]
+
+    def get_living_units(self) -> list[Unit]:
+        return [u for team in self.teams
+                for f in team.get_formations()
+                for u in f.get_living_units()]
+
+    def get_all_formations(self) -> list[Formation]:
+        return [f for team in self.teams
+                for f in team.get_formations()]
+
+    # ==================================================================
+    # Terrain queries
+    # ==================================================================
+
+    def _clamp_grid(self, x: float, y: float) -> tuple[int, int]:
+        gx = int(np.clip(round(x), 0, self.width - 1))
+        gy = int(np.clip(round(y), 0, self.height - 1))
+        return gx, gy
+
+    def get_terrain_at(self, x: float, y: float) -> int:
+        gx, gy = self._clamp_grid(x, y)
+        return int(self.terrain_map[gy, gx])
+
+    def get_height_at(self, x: float, y: float) -> int:
+        gx, gy = self._clamp_grid(x, y)
+        return int(self.height_map[gy, gx])
+
+    # ==================================================================
+    # Curriculum-gated mechanics
+    # ==================================================================
+
+    def get_speed_modifier(self, x: float, y: float) -> float:
+        if self.curriculum_stage < 1:
+            return 1.0
+        terrain = self.get_terrain_at(x, y)
+        return TERRAIN_SPEED.get(terrain, 1.0)
+
+    def is_concealed(self, unit: Unit) -> bool:
+        if self.curriculum_stage < 2:
+            return False
+        return self.get_terrain_at(unit.x, unit.y) == Terrain.FOREST
+
+    def can_detect(self, observer: Unit, target: Unit) -> bool:
+        if self.curriculum_stage < 2:
+            return True
+        if not self.is_concealed(target):
+            return True
+        return (math.hypot(target.x - observer.x,
+                           target.y - observer.y) <= FOREST_DETECTION_RANGE)
+
+    def get_effective_range(self, attacker: Unit) -> float:
+        return float(attacker.range)
+
+    def get_effective_range_against(self, attacker: Unit,
+                                    target: Unit) -> float:
+        base = float(attacker.range)
+        if self.curriculum_stage < 3:
+            return base
+        h_att = self.get_height_at(attacker.x, attacker.y)
+        h_tgt = self.get_height_at(target.x, target.y)
+        delta = (h_att - h_tgt) * HEIGHT_RANGE_BONUS_PER_LEVEL
+        return max(1.0, base + delta)
+
+    def has_line_of_sight(self, a: Unit, b: Unit) -> bool:
+        if self.curriculum_stage < 3:
+            return True
+
+        ax, ay = self._clamp_grid(a.x, a.y)
+        bx, by = self._clamp_grid(b.x, b.y)
+
+        h_a = self.height_map[ay, ax]
+        h_b = self.height_map[by, bx]
+        max_endpoint = max(h_a, h_b)
+
+        for gx, gy in self._bresenham(ax, ay, bx, by):
+            if (gx, gy) == (ax, ay) or (gx, gy) == (bx, by):
+                continue
+            if self.height_map[gy, gx] > max_endpoint:
+                return False
+        return True
+
+    @staticmethod
+    def _bresenham(x0: int, y0: int, x1: int, y1: int):
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        while True:
+            yield (x0, y0)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+
+    # ==================================================================
+    # Visibility
+    # ==================================================================
+
+    def can_see(self, observer: Unit, target: Unit) -> bool:
+        if target.is_dead():
+            return False
+        if not self.can_detect(observer, target):
+            return False
+        if not self.has_line_of_sight(observer, target):
+            return False
+        return True
+
+    def get_visible_enemies(self, friendly: Team, enemy: Team) -> list[Unit]:
+        friendly_living = friendly.get_living_units()
+        enemy_living = enemy.get_living_units()
+
+        if not friendly_living:
+            return []
+
+        visible = []
+        for enemy_unit in enemy_living:
+            for ally in friendly_living:
+                if self.can_see(ally, enemy_unit):
+                    visible.append(enemy_unit)
+                    break
+        return visible
+
+    # ==================================================================
+    # Single-pair targeting (kept for BattleEnv / external callers)
+    # ==================================================================
+
+    def in_range(self, attacker: Unit, target: Unit) -> bool:
+        eff_range = self.get_effective_range_against(attacker, target)
+        dist = math.hypot(target.x - attacker.x, target.y - attacker.y)
+        return dist <= eff_range
+
+    def can_target(self, attacker: Unit, target: Unit) -> bool:
+        if target.is_dead():
+            return False
+        if target.get_team() == attacker.get_team():
+            return False
+        if not self.can_detect(attacker, target):
+            return False
+        if not self.has_line_of_sight(attacker, target):
+            return False
+        if not self.in_range(attacker, target):
+            return False
+        return True
+
+    # ==================================================================
+    # Formation-based combat
+    # ==================================================================
+
+    def _combat_phase(self, living: list[Unit]):
+        """
+        Formation-based combat using a KDTree for nearest-enemy lookup.
+
+        Builds one KDTree per team from all living enemies, then queries
+        all attackers at once — replacing the brute-force inner loop.
+        """
+        for team in self.teams:
+            # Gather ALL living enemies into a single pool
+            enemy_units = []
+            for et in self.teams:
+                if et.team_id == team.team_id:
+                    continue
+                for f in et.get_formations():
+                    enemy_units.extend(f.get_living_units())
+
+            if not enemy_units:
+                continue
+
+            # One tree for all enemies this team can target
+            enemy_pos = np.array([[u.x, u.y] for u in enemy_units])
+            enemy_tree = cKDTree(enemy_pos)
+
+            # Gather all living attackers on this team
+            attackers = []
+            for f in team.get_formations():
+                attackers.extend(f.get_living_units())
+
+            if not attackers:
+                continue
+
+            attacker_pos = np.array([[u.x, u.y] for u in attackers])
+
+            # Single vectorised call: nearest enemy for every attacker
+            dists, indices = enemy_tree.query(attacker_pos)
+
+            for i, attacker in enumerate(attackers):
+                if attacker.is_dead():
+                    continue
+
+                if dists[i] > attacker.range:
+                    continue
+
+                candidate = enemy_units[indices[i]]
+                if candidate.is_dead():
+                    continue
+                if self.curriculum_stage >= 2 and not self.can_detect(attacker, candidate):
+                    continue
+                if self.curriculum_stage >= 3 and not self.has_line_of_sight(attacker, candidate):
+                    continue
+
+                attacker.attack(candidate)
+
+    # ==================================================================
+    # Collision separation
+    # ==================================================================
+
+    def _resolve_collisions(self, living: list[Unit],
+                            iterations: int = 3):
+        """
+        Push overlapping units apart over several iterations.
+
+        Uses cKDTree to find all pairs within the maximum possible
+        collision distance, then applies a separation vector to each
+        overlapping pair — half the overlap to each unit.
+        """
+        if len(living) < 2:
+            return
+
+        max_radius = max(u.radius for u in living)
+        query_radius = max_radius * 2
+
+        for _ in range(iterations):
+            positions = np.array([[u.x, u.y] for u in living])
+            tree = cKDTree(positions)
+            pairs = tree.query_pairs(query_radius)
+
+            if not pairs:
+                break  # no overlaps — nothing to resolve
+
+            resolved_any = False
+            for i, j in pairs:
+                a = living[i]
+                b = living[j]
+
+                dx = b.x - a.x
+                dy = b.y - a.y
+                dist = math.hypot(dx, dy)
+
+                min_dist = a.radius + b.radius
+                if dist >= min_dist:
+                    continue
+
+                resolved_any = True
+                overlap = min_dist - dist
+
+                if dist > 0:
+                    nx = dx / dist
+                    ny = dy / dist
+                else:
+                    # Exactly overlapping — pick arbitrary direction
+                    nx = 1.0
+                    ny = 0.0
+
+                push = overlap / 2
+
+                a.x -= nx * push
+                a.y -= ny * push
+                b.x += nx * push
+                b.y += ny * push
+
+            # Clamp to world bounds
+            for u in living:
+                u.x = max(0, min(self.width - 1, u.x))
+                u.y = max(0, min(self.height - 1, u.y))
+
+            if not resolved_any:
+                break  # pairs were in query range but none actually overlapped
+
+    # ==================================================================
+    # Tick
+    # ==================================================================
+
+    def tick(self):
+        living = self.get_living_units()
+
+        # ── movement phase ────────────────────────────────────────────
+        if self.curriculum_stage < 1:
+            for formation in self.get_all_formations():
+                formation.on_tick(self.tick_rate)
+        else:
+            for unit in living:
+                modifier = self.get_speed_modifier(unit.x, unit.y)
+                unit.on_tick(self.tick_rate, modifier)
+
+        # ── collision separation ──────────────────────────────────────
+        self._resolve_collisions(living)
+
+        # ── combat phase ──────────────────────────────────────────────
+        self._combat_phase(living)
+
+    # ==================================================================
+    # Population
+    # ==================================================================
+
+    def populate_team(self, team: Team,
+                      min_formations: int = 1, max_formations: int = 3,
+                      min_units: int = 10, max_units: int = 50):
+        num_formations = np.random.randint(min_formations, max_formations + 1)
+
+        margin = 5
+        available_height = self.height - 2 * margin
+        slot_height = available_height / num_formations
+
+        if not team.team_id:
+            x_start, x_end = 10, 30
+        else:
+            x_start, x_end = self.width - 30, self.width - 10
+
+        for i in range(num_formations):
+            unit_type = np.random.choice(list(UNIT_TYPES.keys()))
+            amount = np.random.randint(min_units, max_units + 1)
+
+            UnitClass = UNIT_TYPES[unit_type]
+            units = [UnitClass() for _ in range(amount)]
+
+            for unit in units:
+                unit.set_team(team.team_id)
+
+            y_top = margin + i * slot_height
+            y_bottom = margin + (i + 1) * slot_height
+
+            formation = Formation(units)
+            formation.set_port(x_start, y_top)
+            formation.set_starboard(x_end, y_bottom)
+            formation.place_units()
+
+            team.add_formation(formation)
+
+        self.add_team(team)
+
+    # ==================================================================
+    # Terrain generation
+    # ==================================================================
 
     def _generate_perlin_noise(self, scale: float = 50.0, octaves: int = 6,
-                               persistence: float = 0.5, lacunarity: float = 2.0) -> np.ndarray:
+                               persistence: float = 0.5,
+                               lacunarity: float = 2.0) -> np.ndarray:
         noise_map = np.zeros((self.height, self.width))
         amplitude = 1.0
         frequency = 1.0
@@ -250,11 +659,12 @@ class World:
         top_right    = random_grid[y0_2d, x1_2d]
         bottom_left  = random_grid[y1_2d, x0_2d]
         bottom_right = random_grid[y1_2d, x1_2d]
-        top    = top_left  * (1 - sx_2d) + top_right  * sx_2d
+        top    = top_left * (1 - sx_2d) + top_right * sx_2d
         bottom = bottom_left * (1 - sx_2d) + bottom_right * sx_2d
         return top * (1 - sy_2d) + bottom * sy_2d
 
-    def _apply_cellular_automata(self, grid: np.ndarray, iterations: int = 3) -> np.ndarray:
+    def _apply_cellular_automata(self, grid: np.ndarray,
+                                 iterations: int = 3) -> np.ndarray:
         smoothed = np.copy(grid)
         kernel = np.ones((3, 3), dtype=int)
         for _ in range(iterations):
@@ -262,88 +672,25 @@ class World:
             counts = np.zeros((len(unique_vals), self.height, self.width))
             for i, val in enumerate(unique_vals):
                 mask = (smoothed == val).astype(int)
-                counts[i] = convolve2d(mask, kernel, mode='same', boundary='fill')
+                counts[i] = convolve2d(mask, kernel, mode='same',
+                                       boundary='fill')
             winner_indices = np.argmax(counts, axis=0)
             smoothed = unique_vals[winner_indices]
         return smoothed
 
     def _generate_terrain_map(self) -> np.ndarray:
-        noise = self._generate_perlin_noise(scale=30.0, octaves=6, persistence=0.5)
+        noise = self._generate_perlin_noise(scale=30.0, octaves=6,
+                                            persistence=0.5)
         terrain_map = np.zeros((self.height, self.width), dtype=int)
-        terrain_map[noise < 0.35] = 1
-        terrain_map[(noise >= 0.35) & (noise < 0.65)] = 0
-        terrain_map[noise >= 0.65] = 2
+        terrain_map[noise < 0.35] = Terrain.WATER
+        terrain_map[(noise >= 0.35) & (noise < 0.65)] = Terrain.PLAINS
+        terrain_map[noise >= 0.65] = Terrain.FOREST
         return self._apply_cellular_automata(terrain_map, iterations=5)
 
     def _generate_height_map(self) -> np.ndarray:
-        noise = self._generate_perlin_noise(scale=25.0, octaves=4, persistence=0.6)
+        noise = self._generate_perlin_noise(scale=25.0, octaves=4,
+                                            persistence=0.6)
         height_map = np.clip((noise * 5).astype(int), 0, 5)
         height_map = self._apply_cellular_automata(height_map, iterations=3)
-        height_map[self.terrain_map == 1] = 0
+        height_map[self.terrain_map == Terrain.WATER] = 0
         return height_map
-
-    # ------------------------------------------------------------------
-    # Population
-    # ------------------------------------------------------------------
-
-    def populate_teams(self):
-        """
-        Formations are spread evenly down the map vertically.
-        Team False = left side, Team True = right side.
-        """
-        num_formations = 1
-        units_per_formation = 50
-        half_height = 40
-
-        for i in range(num_formations):
-            y_centre = int((i + 0.5) * self.height / num_formations)
-            y_top    = max(0, y_centre - half_height)
-            y_bottom = min(self.height - 1, y_centre + half_height)
-
-            f1 = Formation([Infantry() for _ in range(units_per_formation)])
-            f2 = Formation([Infantry() for _ in range(units_per_formation)])
-
-            f1.set_port(10, y_top)
-            f1.set_starboard(10, y_bottom)
-            f2.set_port(self.width - 10, y_top)
-            f2.set_starboard(self.width - 10, y_bottom)
-
-            f1.place_units()
-            f2.place_units()
-
-            self.add_formation(f1, team=False)
-            self.add_formation(f2, team=True)
-
-    # ------------------------------------------------------------------
-    # World management
-    # ------------------------------------------------------------------
-
-    def add_formation(self, formation: Formation, team: bool | None = None):
-        self.formations.append(formation)
-        for unit in formation.get_units():
-            if team is not None:
-                unit.set_team(team)
-            self.units.append(unit)
-
-    def remove_formation(self, formation: Formation):
-        self.formations.remove(formation)
-        for unit in formation.get_units():
-            if unit in self.units:
-                self.units.remove(unit)
-
-    def add_unit(self, unit: Unit, x: float, y: float):
-        unit.set_x(x)
-        unit.set_y(y)
-        self.units.append(unit)
-
-    def remove_unit(self, unit: Unit):
-        self.units.remove(unit)
-
-    def tick(self):
-        """
-        Advance world state by one tick.
-        World passes tick_rate down to formations; formations pass it to units.
-        No object passes itself downward.
-        """
-        for formation in self.formations:
-            formation.on_tick(self.tick_rate)

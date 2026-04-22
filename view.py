@@ -60,10 +60,30 @@ class WorldView:
 
             cx = unit.get_x() * ts
             cy = unit.get_y() * ts
-            self.canvas.create_oval(
-                cx - half, cy - half, cx + half, cy + half,
-                fill=color, outline=outline, width=2
-            )
+
+            if unit_type == 'Infantry':
+                self.canvas.create_rectangle(
+                    cx - half, cy - half, cx + half, cy + half,
+                    fill=color, outline=outline, width=2
+                )
+            elif unit_type == 'Archer':
+                self.canvas.create_oval(
+                    cx - half, cy - half, cx + half, cy + half,
+                    fill=color, outline=outline, width=2
+                )
+            elif unit_type == 'Cavalry':
+                # Triangle pointing up
+                self.canvas.create_polygon(
+                    cx, cy - half,           # top
+                    cx - half, cy + half,    # bottom-left
+                    cx + half, cy + half,    # bottom-right
+                    fill=color, outline=outline, width=2
+                )
+            else:
+                self.canvas.create_oval(
+                    cx - half, cy - half, cx + half, cy + half,
+                    fill=color, outline=outline, width=2
+                )
 
     def rebuild_terrain(self):
         self._build_terrain_image()

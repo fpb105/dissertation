@@ -1,462 +1,377 @@
-"""
-BattleEnv — Gymnasium wrapper around the Team-based World simulator.
-
-Observation (per formation, zero-padded to MAX_FORMATIONS):
-  Index   Feature
-  ──────  ─────────────────────────────────────────
-  0-1     Formation port (x, y), normalised
-  2-3     Formation starboard (x, y), normalised
-  4       Alive count / starting count
-  5       Average HP / MAX_UNIT_HP
-  6       Terrain under centroid (0=plains, 0.5=forest, 1=water)
-  7       Height under centroid / 5
-
-  Repeated for: friendly formations (0..MAX_F-1),
-                enemy formations   (MAX_F..2*MAX_F-1)
-
-  Then 2 global features:
-    - friendly alive ratio
-    - enemy alive ratio
-
-  Total obs size: 2 * MAX_FORMATIONS * 8 + 2
-
-Action space:
-  MultiDiscrete — one 9-way direction per friendly formation.
-  0=stay, 1=N, 2=NE, 3=E, 4=SE, 5=S, 6=SW, 7=W, 8=NW
-  Padded to MAX_FORMATIONS (extra actions ignored).
-"""
-
-from __future__ import annotations
-
-import math
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import math
 
-from model import (
-    World, Team, Formation,
-    Infantry, Archer, Cavalry, Terrain, Unit,
-)
+import model
 
-TERRAIN_OBS = {
-    Terrain.PLAINS: 0.0,
-    Terrain.WATER:  1.0,
-    Terrain.FOREST: 0.5,
+# ── Constants ──────────────────────────────────────────────────────
+MAX_FORMATIONS = 6
+FEATURES_PER_FORMATION = 8   # added avg_y
+NUM_GLOBAL_FEATURES = 3
+OBS_SIZE = (MAX_FORMATIONS * FEATURES_PER_FORMATION * 2) + NUM_GLOBAL_FEATURES
+
+# Each formation: (port_x, port_y, starboard_x, starboard_y)
+ACTIONS_PER_FORMATION = 4
+
+UNIT_TYPE_ENCODING = {
+    "infantry": 0.0,
+    "archer":   0.5,
+    "cavalry":  1.0,
 }
 
-MAX_UNIT_HP = 120  # Cavalry, the highest
+UNIT_CLASS_TO_TYPE = {
+    model.Infantry: "infantry",
+    model.Archer:   "archer",
+    model.Cavalry:  "cavalry",
+}
+
+MAX_STEPS = 2000
+
+# How far the scripted opponent's target advances per tick
+SCRIPTED_ADVANCE_SPEED = 2.0
 
 
 class BattleEnv(gym.Env):
 
-    metadata = {"render_modes": ["human"], "render_fps": 10}
-
-    MAX_FORMATIONS = 4
-    MOVE_STEP = 5.0
-
-    # Reward weights
-    KILL_REWARD = 1.0
-    DEATH_PENALTY = 1.0
-    WIN_BONUS = 10.0
-    LOSE_PENALTY = -10.0
-    STEP_PENALTY = -0.01
-
-    def __init__(
-        self,
-        width: int = 200,
-        height: int = 200,
-        tick_rate: int = 10,
-        ticks_per_step: int = 5,
-        max_steps: int = 500,
-        curriculum_stage: int = 0,
-        min_formations: int = 1,
-        max_formations: int = 3,
-        min_units: int = 10,
-        max_units: int = 50,
-        opponent_model=None,
-        render_mode: str | None = None,
-    ):
+    def __init__(self, curriculum_stage: int = 0, frame_skip: int = 1):
         super().__init__()
-        self.width = width
-        self.height = height
-        self.tick_rate = tick_rate
-        self.ticks_per_step = ticks_per_step
-        self.max_steps = max_steps
-        self.curriculum_stage = curriculum_stage
-        self.min_formations = min_formations
-        self.max_formations = max_formations
-        self.min_units = min_units
-        self.max_units = max_units
-        self.opponent_model = opponent_model
-        self.render_mode = render_mode
 
-        # Observation: per-formation features × 2 teams + 2 global
-        self.FEATURES_PER_FORMATION = 8
-        obs_size = 2 * self.MAX_FORMATIONS * self.FEATURES_PER_FORMATION + 2
-        self.OBS_SIZE = obs_size
+        # ── Continuous action space ───────────────────────────────
+        # Flat vector of (port_x, port_y, star_x, star_y) per formation.
+        # Range [-1, 1], rescaled to world coordinates in step().
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(MAX_FORMATIONS * ACTIONS_PER_FORMATION,),
+            dtype=np.float32,
+        )
+
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+            low=0.0, high=1.0,
+            shape=(OBS_SIZE,),
+            dtype=np.float32,
         )
 
-        # Action: one 9-way direction per friendly formation
-        self.action_space = spaces.MultiDiscrete(
-            [9] * self.MAX_FORMATIONS
-        )
+        self.curriculum_stage = curriculum_stage
+        self.tick_rate = 10
+        self.frame_skip = frame_skip
+        self.world = None
+        self.friendly_team = None
+        self.enemy_team = None
+        self.current_step = 0
 
-        # State
-        self.world: World | None = None
-        self.friendly_team: Team | None = None
-        self.enemy_team: Team | None = None
-        self._step_count = 0
-        self._initial_friendly = 0
-        self._initial_enemy = 0
-        self._prev_friendly_alive = 0
-        self._prev_enemy_alive = 0
+        # ── Opponent ──────────────────────────────────────────────
+        self.opponent_model = None
         self.opponent_lstm_states = None
+        self.opponent_episode_start = None
 
-    # ==================================================================
-    # Reset
-    # ==================================================================
+    # ── Curriculum / opponent management ──────────────────────────
+    def set_curriculum_stage(self, stage: int):
+        self.curriculum_stage = stage
 
+    def get_curriculum_stage(self) -> int:
+        return self.curriculum_stage
+
+    def set_opponent_model(self, path: str | None):
+        if path is None:
+            self.opponent_model = None
+        else:
+            from sb3_contrib import RecurrentPPO
+            self.opponent_model = RecurrentPPO.load(path)
+
+    # ── Helpers ───────────────────────────────────────────────────
+    def _decode_positions(self, raw: np.ndarray) -> np.ndarray:
+        """
+        Map raw actions from [-1, 1] to world coordinates.
+
+        Input shape:  (MAX_FORMATIONS, 4)
+        Output shape: (MAX_FORMATIONS, 4) — (px, py, sx, sy) in world units
+
+        [-1, 1] → [0, 1] → [0, dimension].
+        Clamped to world bounds.
+        """
+        decoded = np.empty_like(raw)
+        decoded[:, 0] = (raw[:, 0] + 1.0) / 2.0 * self.world.width
+        decoded[:, 1] = (raw[:, 1] + 1.0) / 2.0 * self.world.height
+        decoded[:, 2] = (raw[:, 2] + 1.0) / 2.0 * self.world.width
+        decoded[:, 3] = (raw[:, 3] + 1.0) / 2.0 * self.world.height
+        decoded[:, [0, 2]] = np.clip(decoded[:, [0, 2]], 0, self.world.width - 1)
+        decoded[:, [1, 3]] = np.clip(decoded[:, [1, 3]], 0, self.world.height - 1)
+        return decoded
+
+    # ── Reset ─────────────────────────────────────────────────────
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.world = World(
-            width=self.width,
-            height=self.height,
-            tick_rate=self.tick_rate,
-            curriculum_stage=self.curriculum_stage,
-        )
+        self.world = model.World(300, 300, self.tick_rate, self.curriculum_stage)
 
-        self.friendly_team = Team(team_id=False)
-        self.enemy_team = Team(team_id=True)
+        self.friendly_team = model.Team(team_id=False)
+        self.enemy_team = model.Team(team_id=True)
 
-        self.world.populate_team(
-            self.friendly_team,
-            min_formations=self.min_formations,
-            max_formations=self.max_formations,
-            min_units=self.min_units,
-            max_units=self.max_units,
-        )
-        self.world.populate_team(
-            self.enemy_team,
-            min_formations=self.min_formations,
-            max_formations=self.max_formations,
-            min_units=self.min_units,
-            max_units=self.max_units,
-        )
+        self.world.populate_team(self.friendly_team)
+        self.world.populate_team(self.enemy_team)
 
-        self._step_count = 0
-        self._initial_friendly = len(self.friendly_team.get_all_units())
-        self._initial_enemy = len(self.enemy_team.get_all_units())
-        self._prev_friendly_alive = self._initial_friendly
-        self._prev_enemy_alive = self._initial_enemy
+        self.current_step = 0
+
         self.opponent_lstm_states = None
+        self.opponent_episode_start = np.ones((1,), dtype=bool)
 
-        obs = self._get_observation()
-        info = self._get_info()
-        return obs, info
+        self.prev_friendly_hp = self._total_hp(self.friendly_team)
+        self.prev_enemy_hp = self._total_hp(self.enemy_team)
+        self.prev_avg_distance = self._avg_distance_to_enemy()
 
-    # ==================================================================
-    # Step
-    # ==================================================================
+        obs = self._build_obs()
+        return obs, {}
 
+    # ── Step ──────────────────────────────────────────────────────
     def step(self, action):
-        self._step_count += 1
+        # (MAX_FORMATIONS * 4,) → (MAX_FORMATIONS, 4)
+        raw = action.reshape(MAX_FORMATIONS, ACTIONS_PER_FORMATION)
+        positions = self._decode_positions(raw)
 
-        # Apply agent action to friendly formations
-        self._apply_action(self.friendly_team, action, mirror=False)
+        total_reward = 0.0
+        terminated = False
+        truncated = False
 
-        # Apply opponent action to enemy formations
-        self._opponent_policy()
+        for _ in range(self.frame_skip):
+            # ── Friendly: set formation targets ───────────────────
+            friendly_formations = self.friendly_team.get_formations()
+            for i, formation in enumerate(friendly_formations):
+                if i >= MAX_FORMATIONS:
+                    break
+                if not formation.get_living_units():
+                    continue
 
-        # Tick the simulation
-        for _ in range(self.ticks_per_step):
+                px, py, sx, sy = positions[i]
+                formation.move(
+                    px, py, sx, sy,
+                    facing_right=True,
+                )
+
+            # ── Opponent acts ─────────────────────────────────────
+            self._opponent_act()
+
+            # ── Simulation tick ───────────────────────────────────
             self.world.tick()
+            self.current_step += 1
 
-        # Count alive
-        friendly_alive = len(self.friendly_team.get_living_units())
-        enemy_alive = len(self.enemy_team.get_living_units())
+            reward = self._compute_reward()
+            total_reward += reward
 
-        # Reward
-        reward = self._compute_reward(friendly_alive, enemy_alive)
+            terminated = (
+                self.friendly_team.is_defeated()
+                or self.enemy_team.is_defeated()
+            )
+            truncated = self.current_step >= MAX_STEPS
 
-        self._prev_friendly_alive = friendly_alive
-        self._prev_enemy_alive = enemy_alive
-
-        # Termination
-        terminated = friendly_alive == 0 or enemy_alive == 0
-        truncated = self._step_count >= self.max_steps
-
-        obs = self._get_observation()
-        info = self._get_info()
-
-        return obs, reward, terminated, truncated, info
-
-    # ==================================================================
-    # Action interpretation
-    # ==================================================================
-
-    # Direction vectors for 9-way movement (0 = stay)
-    _DIRS = [
-        (0, 0),    # 0: stay
-        (0, -1),   # 1: N
-        (1, -1),   # 2: NE
-        (1, 0),    # 3: E
-        (1, 1),    # 4: SE
-        (0, 1),    # 5: S
-        (-1, 1),   # 6: SW
-        (-1, 0),   # 7: W
-        (-1, -1),  # 8: NW
-    ]
-
-    def _apply_action(self, team: Team, action, mirror: bool = False):
-        formations = team.get_formations()
-        for i, formation in enumerate(formations):
-            if i >= self.MAX_FORMATIONS:
+            if terminated or truncated:
                 break
 
-            d = int(action[i])
-            dx, dy = self._DIRS[d]
+        obs = self._build_obs()
+        info = {}
+        if terminated:
+            info["won"] = self.enemy_team.is_defeated()
 
-            if mirror:
-                dx = -dx  # flip x for opponent's perspective
+        return obs, total_reward, terminated, truncated, info
 
-            px, py = formation.get_port()
-            sx, sy = formation.get_starboard()
+    # ── Opponent logic ────────────────────────────────────────────
+    def _opponent_act(self):
+        enemy_formations = self.enemy_team.get_formations()
 
-            step = self.MOVE_STEP
-            new_px = np.clip(px + dx * step, 0, self.width)
-            new_py = np.clip(py + dy * step, 0, self.height)
-            new_sx = np.clip(sx + dx * step, 0, self.width)
-            new_sy = np.clip(sy + dy * step, 0, self.height)
-
-            formation.move(new_px, new_py, new_sx, new_sy, self.tick_rate)
-
-    # ==================================================================
-    # Opponent
-    # ==================================================================
-
-    def _opponent_policy(self):
-        if self.opponent_model is not None:
-            obs = self._get_mirror_observation()
-            action, self.opponent_lstm_states = self.opponent_model.predict(
-                obs,
-                state=self.opponent_lstm_states,
-                episode_start=np.array([False]),
-                deterministic=False,
-            )
-            self._apply_action(self.enemy_team, action, mirror=True)
+        if self.opponent_model is None:
+            # Scripted: slide each formation's target toward the player
+            advance_step = SCRIPTED_ADVANCE_SPEED / self.tick_rate
+            for formation in enemy_formations:
+                if not formation.get_living_units():
+                    continue
+                px, py = formation.get_port()
+                sx, sy = formation.get_starboard()
+                formation.move(
+                    px - advance_step, py,
+                    sx - advance_step, sy,
+                    facing_right=False,
+                )
         else:
-            self._heuristic_opponent()
+            # Self-play: query frozen policy with mirrored obs
+            opponent_obs = self._build_opponent_obs()
+            obs_batch = np.expand_dims(opponent_obs, axis=0)
 
-    def _heuristic_opponent(self):
-        """Simple: each enemy formation walks toward friendly centroid."""
-        friendly_living = self.friendly_team.get_living_units()
-        if not friendly_living:
-            return
+            enemy_action, self.opponent_lstm_states = (
+                self.opponent_model.predict(
+                    obs_batch,
+                    state=self.opponent_lstm_states,
+                    episode_start=self.opponent_episode_start,
+                    deterministic=False,
+                )
+            )
+            self.opponent_episode_start = np.zeros((1,), dtype=bool)
+            enemy_action = enemy_action.squeeze(0)
 
-        fx = np.mean([u.get_x() for u in friendly_living])
-        fy = np.mean([u.get_y() for u in friendly_living])
+            raw = enemy_action.reshape(MAX_FORMATIONS, ACTIONS_PER_FORMATION)
+            positions = self._decode_positions(raw)
 
-        for formation in self.enemy_team.get_formations():
-            px, py = formation.get_port()
-            sx, sy = formation.get_starboard()
-            cx = (px + sx) / 2
-            cy = (py + sy) / 2
+            for i, formation in enumerate(enemy_formations):
+                if i >= MAX_FORMATIONS:
+                    break
+                if not formation.get_living_units():
+                    continue
 
-            dx = fx - cx
-            dy = fy - cy
-            mag = math.hypot(dx, dy) or 1.0
+                px, py, sx, sy = positions[i]
+                # Mirror x: the opponent's policy sees a mirrored world,
+                # so its output port/star x are from its own perspective.
+                # Flip them back to true world coordinates.
+                px = self.world.width - px
+                sx = self.world.width - sx
+                formation.move(
+                    px, py, sx, sy,
+                    facing_right=False,
+                )
 
-            move_x = dx / mag * self.MOVE_STEP
-            move_y = dy / mag * self.MOVE_STEP
+    def _build_opponent_obs(self) -> np.ndarray:
+        obs = np.zeros(OBS_SIZE, dtype=np.float32)
+        self._encode_team_formations(
+            obs, self.enemy_team.get_formations(),
+            offset=0, mirror_x=True,
+        )
+        self._encode_team_formations(
+            obs, self.friendly_team.get_formations(),
+            offset=MAX_FORMATIONS * FEATURES_PER_FORMATION,
+            mirror_x=True,
+        )
+        self._encode_global_features(
+            obs, offset=MAX_FORMATIONS * FEATURES_PER_FORMATION * 2,
+        )
+        return obs
 
-            formation.move(
-                np.clip(px + move_x, 0, self.width),
-                np.clip(py + move_y, 0, self.height),
-                np.clip(sx + move_x, 0, self.width),
-                np.clip(sy + move_y, 0, self.height),
-                self.tick_rate,
+    # ── Observation builder ───────────────────────────────────────
+    def _build_obs(self) -> np.ndarray:
+        obs = np.zeros(OBS_SIZE, dtype=np.float32)
+        self._encode_team_formations(
+            obs, self.friendly_team.get_formations(),
+            offset=0, mirror_x=False,
+        )
+        self._encode_team_formations(
+            obs, self.enemy_team.get_formations(),
+            offset=MAX_FORMATIONS * FEATURES_PER_FORMATION,
+            mirror_x=False,
+        )
+        self._encode_global_features(
+            obs, offset=MAX_FORMATIONS * FEATURES_PER_FORMATION * 2,
+        )
+        return obs
+
+    def _encode_team_formations(self, obs, formations, offset,
+                                 mirror_x=False):
+        for i, formation in enumerate(formations):
+            if i >= MAX_FORMATIONS:
+                break
+            living = formation.get_living_units()
+            if not living:
+                continue
+
+            base = offset + (i * FEATURES_PER_FORMATION)
+            unit_type_name = UNIT_CLASS_TO_TYPE.get(
+                type(living[0]), "infantry"
             )
 
-    # ==================================================================
-    # Observation
-    # ==================================================================
+            xs = [u.get_x() for u in living]
+            ys = [u.get_y() for u in living]
+            avg_x = sum(xs) / len(xs)
+            avg_y = sum(ys) / len(ys)
+            min_x = min(xs)
+            max_x = max(xs)
 
-    def _get_formation_features(self, formation: Formation,
-                                 starting_count: int) -> np.ndarray:
-        """8 features for one formation, all normalised to [0, 1]."""
-        feats = np.zeros(self.FEATURES_PER_FORMATION, dtype=np.float32)
+            if mirror_x:
+                avg_x = self.world.width - avg_x
+                min_x, max_x = (
+                    self.world.width - max_x,
+                    self.world.width - min_x,
+                )
 
-        living = formation.get_living_units()
-        if not living:
-            return feats
+            obs[base + 0] = 1.0                                        # alive
+            obs[base + 1] = UNIT_TYPE_ENCODING.get(unit_type_name, 0.0) # type
+            obs[base + 2] = min(len(living) / 50.0, 1.0)               # count
+            obs[base + 3] = min_x / self.world.width                    # left edge
+            obs[base + 4] = max_x / self.world.width                    # right edge
+            obs[base + 5] = avg_y / self.world.height                   # vertical pos
+            obs[base + 6] = self.world.get_height_at(avg_x, avg_y) / 5.0
+            obs[base + 7] = self.world.get_terrain_at(avg_x, avg_y) / 2.0
 
-        px, py = formation.get_port()
-        sx, sy = formation.get_starboard()
+    def _encode_global_features(self, obs, offset):
+        obs[offset + 0] = self.current_step / MAX_STEPS
+        obs[offset + 1] = self.world.get_width() / 1000.0
+        obs[offset + 2] = self.world.get_height() / 1000.0
 
-        feats[0] = px / self.width
-        feats[1] = py / self.height
-        feats[2] = sx / self.width
-        feats[3] = sy / self.height
-        feats[4] = len(living) / max(starting_count, 1)
-        feats[5] = np.mean([u.get_hp() for u in living]) / MAX_UNIT_HP
+    # ── Reward ────────────────────────────────────────────────────
+    def _total_hp(self, team) -> int:
+        return sum(u.get_hp() for u in team.get_living_units())
 
-        # Terrain and height under centroid
-        cx = np.mean([u.get_x() for u in living])
-        cy = np.mean([u.get_y() for u in living])
-        terrain = self.world.get_terrain_at(cx, cy)
-        feats[6] = TERRAIN_OBS.get(terrain, 0.0)
-        feats[7] = self.world.get_height_at(cx, cy) / 5.0
+    def _avg_distance_to_enemy(self) -> float:
+        friendly_formations = self.friendly_team.get_formations()
+        enemy_formations = self.enemy_team.get_formations()
 
-        return feats
+        friendly_centres = []
+        for f in friendly_formations:
+            living = f.get_living_units()
+            if living:
+                cx = sum(u.get_x() for u in living) / len(living)
+                cy = sum(u.get_y() for u in living) / len(living)
+                friendly_centres.append((cx, cy))
 
-    def _build_team_obs(self, team: Team, starting_count: int) -> np.ndarray:
-        """Observation block for one team: MAX_FORMATIONS × 8 features."""
-        block = np.zeros(
-            self.MAX_FORMATIONS * self.FEATURES_PER_FORMATION,
-            dtype=np.float32,
-        )
-        formations = team.get_formations()
-        per_formation_start = starting_count // max(len(formations), 1)
+        enemy_centres = []
+        for f in enemy_formations:
+            living = f.get_living_units()
+            if living:
+                cx = sum(u.get_x() for u in living) / len(living)
+                cy = sum(u.get_y() for u in living) / len(living)
+                enemy_centres.append((cx, cy))
 
-        for i, f in enumerate(formations):
-            if i >= self.MAX_FORMATIONS:
-                break
-            start = i * self.FEATURES_PER_FORMATION
-            block[start:start + self.FEATURES_PER_FORMATION] = \
-                self._get_formation_features(f, per_formation_start)
+        if not friendly_centres or not enemy_centres:
+            return 0.0
 
-        return block
+        total = 0.0
+        count = 0
+        for fx, fy in friendly_centres:
+            for ex, ey in enemy_centres:
+                total += math.hypot(fx - ex, fy - ey)
+                count += 1
 
-    def _get_observation(self) -> np.ndarray:
-        obs = np.zeros(self.OBS_SIZE, dtype=np.float32)
+        return total / count if count else 0.0
 
-        friendly_block = self._build_team_obs(
-            self.friendly_team, self._initial_friendly
-        )
-        enemy_block = self._build_team_obs(
-            self.enemy_team, self._initial_enemy
-        )
+    def _compute_reward(self) -> float:
+        reward = 0.0
 
-        f_len = self.MAX_FORMATIONS * self.FEATURES_PER_FORMATION
-        obs[0:f_len] = friendly_block
-        obs[f_len:2 * f_len] = enemy_block
+        # ── 1. HP differential ────────────────────────────────────
+        current_friendly_hp = self._total_hp(self.friendly_team)
+        current_enemy_hp = self._total_hp(self.enemy_team)
 
-        # Global ratios
-        friendly_alive = len(self.friendly_team.get_living_units())
-        enemy_alive = len(self.enemy_team.get_living_units())
-        obs[-2] = friendly_alive / max(self._initial_friendly, 1)
-        obs[-1] = enemy_alive / max(self._initial_enemy, 1)
+        friendly_hp_lost = self.prev_friendly_hp - current_friendly_hp
+        enemy_hp_lost = self.prev_enemy_hp - current_enemy_hp
 
-        return obs
+        hp_scale = max(self.prev_friendly_hp + self.prev_enemy_hp, 1)
+        reward += enemy_hp_lost / hp_scale * 0.5
+        reward -= friendly_hp_lost / hp_scale * 0.1
 
-    def _get_mirror_observation(self) -> np.ndarray:
-        """
-        Observation from the enemy's perspective.
-        Enemy sees itself as 'friendly' (first block) and us as 'enemy'.
-        X coordinates are mirrored.
-        """
-        obs = np.zeros(self.OBS_SIZE, dtype=np.float32)
+        self.prev_friendly_hp = current_friendly_hp
+        self.prev_enemy_hp = current_enemy_hp
 
-        enemy_block = self._build_team_obs(
-            self.enemy_team, self._initial_enemy
-        )
-        friendly_block = self._build_team_obs(
-            self.friendly_team, self._initial_friendly
-        )
+        # ── 2. Approach reward ────────────────────────────────────
+        avg_distance = self._avg_distance_to_enemy()
+        max_distance = self.world.get_diagonal_length()
+        distance_closed = self.prev_avg_distance - avg_distance
+        reward += distance_closed / max_distance * 2.0
+        self.prev_avg_distance = avg_distance
 
-        f_len = self.MAX_FORMATIONS * self.FEATURES_PER_FORMATION
+        # ── 3. Cohesion ───────────────────────────────────────────
+        for formation in self.friendly_team.get_formations():
+            cohesion = formation.measure_formation_cohesion()
+            reward += (cohesion - 0.5) * 0.3
 
-        # Mirror x coordinates (indices 0, 2 within each formation's 8 features)
-        for i in range(self.MAX_FORMATIONS):
-            base = i * self.FEATURES_PER_FORMATION
-            enemy_block[base + 0] = 1.0 - enemy_block[base + 0]
-            enemy_block[base + 2] = 1.0 - enemy_block[base + 2]
-            friendly_block[base + 0] = 1.0 - friendly_block[base + 0]
-            friendly_block[base + 2] = 1.0 - friendly_block[base + 2]
-
-        obs[0:f_len] = enemy_block          # opponent sees itself first
-        obs[f_len:2 * f_len] = friendly_block
-        obs[-2] = len(self.enemy_team.get_living_units()) / max(self._initial_enemy, 1)
-        obs[-1] = len(self.friendly_team.get_living_units()) / max(self._initial_friendly, 1)
-
-        return obs
-
-    # ==================================================================
-    # Reward
-    # ==================================================================
-
-    def _compute_reward(self, friendly_alive: int,
-                         enemy_alive: int) -> float:
-        reward = self.STEP_PENALTY
-
-        # Kills / deaths since last step
-        enemy_killed = self._prev_enemy_alive - enemy_alive
-        friendly_killed = self._prev_friendly_alive - friendly_alive
-
-        reward += enemy_killed * self.KILL_REWARD
-        reward -= friendly_killed * self.DEATH_PENALTY
-
-        # Win / loss bonus
-        if enemy_alive == 0 and friendly_alive > 0:
-            reward += self.WIN_BONUS
-        elif friendly_alive == 0 and enemy_alive > 0:
-            reward += self.LOSE_PENALTY
+        # ── 4. Terminal bonuses ───────────────────────────────────
+        if self.enemy_team.is_defeated():
+            reward += 10.0
+        elif self.friendly_team.is_defeated():
+            reward -= 10.0
 
         return reward
-
-    # ==================================================================
-    # Info
-    # ==================================================================
-
-    def _get_info(self) -> dict:
-        return {
-            "step": self._step_count,
-            "friendly_alive": len(self.friendly_team.get_living_units()),
-            "enemy_alive": len(self.enemy_team.get_living_units()),
-        }
-
-
-# ======================================================================
-# Smoke test
-# ======================================================================
-
-if __name__ == "__main__":
-    env = BattleEnv(width=200, height=200, ticks_per_step=10)
-    obs, info = env.reset(seed=42)
-    print(f"Obs shape: {obs.shape}")
-    print(f"Action space: {env.action_space}")
-    print(f"Info: {info}")
-    print()
-
-    total_reward = 0.0
-    for step in range(500):
-        action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-
-        if step % 50 == 0 or terminated or truncated:
-            print(
-                f"  step={step:3d}  reward={reward:+.3f}  "
-                f"friendly={info['friendly_alive']}  "
-                f"enemy={info['enemy_alive']}"
-            )
-
-        if terminated or truncated:
-            print(f"Episode ended: terminated={terminated} truncated={truncated}")
-            break
-
-    print(f"\nTotal reward: {total_reward:.3f}")
-    env.close()
-
-    try:
-        from stable_baselines3.common.env_checker import check_env
-        env2 = BattleEnv()
-        check_env(env2, warn=True)
-        print("SB3 check_env passed.")
-    except ImportError:
-        print("(SB3 not installed — skipping check_env)")
-    except Exception as e:
-        print(f"check_env failed: {e}")

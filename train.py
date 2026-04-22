@@ -1,140 +1,43 @@
-"""
-train.py — Self-play training loop with model bank and curriculum stages.
-
-Usage:
-    python train.py
-
-Trains a RecurrentPPO agent through self-play.  Early generations
-fight the heuristic opponent, then increasingly fight past versions
-of themselves from a model bank.
-"""
-
-import os
-import random
 from sb3_contrib import RecurrentPPO
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from gym_wrapper import BattleEnv
+from curriculum_callback import CurriculumSelfPlayCallback
 
 
-# ── config ────────────────────────────────────────────────────────────
-
-MODEL_BANK_DIR = "model_bank"
-LOG_DIR = "tb_logs"
-
-CURRICULUM = [
-    # (stage, generations to train, timesteps per generation)
-    (0, 20, 50_000),   # flat map, no terrain effects
-    (1, 20, 50_000),   # terrain speed modifiers
-    (2, 20, 50_000),   # forest concealment
-    (3, 40, 50_000),   # height + LOS
-]
-
-# how many generations to train vs heuristic before using the bank
-HEURISTIC_WARMUP = 3
-
-# RecurrentPPO hyperparameters
-PPO_KWARGS = dict(
-    n_steps=256,
-    batch_size=64,
-    n_epochs=10,
-    learning_rate=3e-4,
-    gamma=0.99,
-    gae_lambda=0.95,
-    verbose=1,
-)
-
-
-# ── helpers ───────────────────────────────────────────────────────────
-
-def get_bank_models() -> list[str]:
-    """Return sorted list of model paths in the bank."""
-    if not os.path.isdir(MODEL_BANK_DIR):
-        return []
-    files = [
-        os.path.join(MODEL_BANK_DIR, f)
-        for f in os.listdir(MODEL_BANK_DIR)
-        if f.endswith(".zip")
-    ]
-    return sorted(files)
-
-
-def pick_opponent(generation: int):
-    """
-    Return an opponent model or None (heuristic).
-
-    First HEURISTIC_WARMUP generations: always heuristic (None).
-    After that: 20% chance of heuristic, 80% chance of random past self.
-    """
-    if generation < HEURISTIC_WARMUP:
-        return None
-
-    bank = get_bank_models()
-    if not bank:
-        return None
-
-    if random.random() < 0.2:
-        return None  # occasional heuristic to prevent forgetting
-
-    path = random.choice(bank)
-    print(f"  Opponent: {os.path.basename(path)}")
-    return RecurrentPPO.load(path)
-
-
-# ── main loop ─────────────────────────────────────────────────────────
-
-def main():
-    os.makedirs(MODEL_BANK_DIR, exist_ok=True)
-
-    model = None
-    generation = 0
-
-    for stage, n_gens, timesteps in CURRICULUM:
-        print(f"\n{'='*60}")
-        print(f"CURRICULUM STAGE {stage} — {n_gens} generations × "
-              f"{timesteps:,} timesteps")
-        print(f"{'='*60}")
-
-        for g in range(n_gens):
-            print(f"\n--- Stage {stage}, generation {generation} ---")
-
-            # pick opponent
-            opponent = pick_opponent(generation)
-            env = BattleEnv(
-                curriculum_stage=stage,
-                opponent_model=opponent,
-            )
-
-            if model is None:
-                # first generation: create from scratch
-                model = RecurrentPPO(
-                    "MlpLstmPolicy",
-                    env,
-                    tensorboard_log=LOG_DIR,
-                    **PPO_KWARGS,
-                )
-            else:
-                # subsequent generations: keep learning, swap env
-                model.set_env(env)
-
-            model.learn(
-                total_timesteps=timesteps,
-                reset_num_timesteps=False,  # keep global step counter
-                tb_log_name=f"stage{stage}",
-            )
-
-            # save to bank
-            save_path = os.path.join(
-                MODEL_BANK_DIR, f"gen_{generation:04d}_stage{stage}"
-            )
-            model.save(save_path)
-            print(f"  Saved: {save_path}")
-
-            generation += 1
-
-    # save final model separately
-    model.save("battle_agent_final")
-    print(f"\nTraining complete. Final model: battle_agent_final.zip")
-    print(f"Model bank: {len(get_bank_models())} checkpoints")
+def make_env(stage):
+    def _init():
+        return BattleEnv(curriculum_stage=stage)
+    return _init
 
 
 if __name__ == "__main__":
-    main()
+    n_envs = 5 #using ryzen 5 3600 with 6 cores, one left for gpu orchestration etc
+
+    env = SubprocVecEnv([make_env(0) for _ in range(n_envs)])
+
+    model = RecurrentPPO(
+        "MlpLstmPolicy",
+        env,
+        n_steps=256,
+        batch_size=256,
+        n_epochs=5,
+        verbose=1,
+        tensorboard_log="./tb_logs/",
+        device="cuda",
+    )
+
+    callback = CurriculumSelfPlayCallback(
+        save_path="./opponent_snapshots",
+        promotion_threshold=0.9,
+        window_size=100,
+        max_stage=3,
+    )
+
+    model.learn(
+        total_timesteps=20_000_000,
+        callback=callback,
+        progress_bar=True,
+    )
+
+    model.save("battle_agent_final")
+    print("Training complete.")

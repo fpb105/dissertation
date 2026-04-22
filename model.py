@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from asyncio.windows_events import NULL
+from asyncio.windows_events import NULL
 import enum
 import numpy as np
 from scipy.signal import convolve2d
@@ -7,6 +9,93 @@ from scipy.spatial import cKDTree
 import math
 from abc import ABC, abstractmethod
 
+ARMY_PRESETS = [
+    # ── Balanced compositions ──────────────────────────────────
+    {
+        "name": "Balanced",
+        "formations": [
+            {"type": "infantry", "count": 30},
+            {"type": "archer",   "count": 20},
+            {"type": "cavalry",  "count": 15},
+        ],
+    },
+    {
+        "name": "Infantry core",
+        "formations": [
+            {"type": "infantry", "count": 40},
+            {"type": "infantry", "count": 25},
+            {"type": "archer",   "count": 15},
+        ],
+    },
+    # ── Ranged heavy ───────────────────────────────────────────
+    {
+        "name": "Archer line",
+        "formations": [
+            {"type": "archer",   "count": 35},
+            {"type": "archer",   "count": 25},
+            {"type": "infantry", "count": 15},
+        ],
+    },
+    {
+        "name": "Ranged screen",
+        "formations": [
+            {"type": "infantry", "count": 15},
+            {"type": "archer",   "count": 40},
+        ],
+    },
+    # ── Cavalry focused ────────────────────────────────────────
+    {
+        "name": "Cavalry hammer",
+        "formations": [
+            {"type": "infantry", "count": 25},
+            {"type": "cavalry",  "count": 30},
+        ],
+    },
+    {
+        "name": "Double envelopment",
+        "formations": [
+            {"type": "cavalry",  "count": 20},
+            {"type": "infantry", "count": 30},
+            {"type": "cavalry",  "count": 20},
+        ],
+    },
+    # ── Extremes ───────────────────────────────────────────────
+    {
+        "name": "Horde",
+        "formations": [
+            {"type": "infantry", "count": 50},
+            {"type": "infantry", "count": 50},
+        ],
+    },
+    {
+        "name": "Elite cavalry",
+        "formations": [
+            {"type": "cavalry",  "count": 25},
+            {"type": "cavalry",  "count": 25},
+        ],
+    },
+    {
+        "name": "Combined arms",
+        "formations": [
+            {"type": "cavalry",  "count": 15},
+            {"type": "infantry", "count": 30},
+            {"type": "archer",   "count": 25},
+            {"type": "cavalry",  "count": 15},
+        ],
+    },
+    {
+        "name": "Skirmish line",
+        "formations": [
+            {"type": "archer",   "count": 10},
+            {"type": "archer",   "count": 10},
+            {"type": "archer",   "count": 10},
+            {"type": "archer",   "count": 10},
+        ],
+    },
+]
+
+DEFAULT_RANK_WIDTH = 10
+DEFAULT_RANK_SPACING = 1.5
 
 # ──────────────────────────────────────────────────────────────────────
 # Terrain constants
@@ -26,6 +115,7 @@ TERRAIN_SPEED = {
 
 FOREST_DETECTION_RANGE = 2.0
 HEIGHT_RANGE_BONUS_PER_LEVEL = 1
+SIGHT_RANGE = 50.0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -43,6 +133,20 @@ class Unit(ABC):
         self.radius: float = 0.5
         self.team: bool = False
         self.destination: tuple[float, float] | None = None
+        self.is_attacking: bool = False
+
+    @property
+    def can_move_while_attacking(self) -> bool:
+        """Override in subclasses that should move during combat."""
+        return False
+
+    def attack(self, target: 'Unit'):
+        target.set_hp(target.get_hp() - self.damage)
+        self.is_attacking = True
+
+    def set_destination(self, x, y):
+        self.destination[0] = x
+        self.destination[1] = y
 
     def get_hp(self) -> int:
         return self.hp
@@ -85,8 +189,7 @@ class Unit(ABC):
 
     # ── movement ──────────────────────────────────────────────────────
 
-    def move(self, destination: tuple[float, float], tick_rate: int,
-             speed_modifier: float = 1.0):
+    def move(self, destination: tuple[float, float], tick_rate: int, speed_modifier: float = 1.0):
         dx = destination[0] - self.x
         dy = destination[1] - self.y
         dist = math.hypot(dx, dy)
@@ -96,18 +199,15 @@ class Unit(ABC):
             self.x += dx * ratio
             self.y += dy * ratio
 
+
     def on_tick(self, tick_rate: int, speed_modifier: float = 1.0):
+        if self.is_attacking and not self.can_move_while_attacking:
+            return
         if self.destination is not None:
             self.move(self.destination, tick_rate, speed_modifier)
             if math.hypot(self.destination[0] - self.x,
                           self.destination[1] - self.y) < 0.01:
                 self.destination = None
-
-    # ── combat ────────────────────────────────────────────────────────
-
-    def attack(self, target: Unit):
-        target.set_hp(target.get_hp() - self.damage)
-
 
 class Infantry(Unit):
     def __init__(self):
@@ -115,7 +215,7 @@ class Infantry(Unit):
         self.hp = 100
         self.damage = 10
         self.range = 1
-        self.speed = 1.0
+        self.speed = 3.0
         self.radius = 0.5
 
 
@@ -123,9 +223,9 @@ class Archer(Unit):
     def __init__(self):
         super().__init__()
         self.hp = 80
-        self.damage = 15
-        self.range = 3
-        self.speed = 1.2
+        self.damage = 5
+        self.range = 50
+        self.speed = 3.6
         self.radius = 0.5
 
 
@@ -135,65 +235,164 @@ class Cavalry(Unit):
         self.hp = 120
         self.damage = 7
         self.range = 1
-        self.speed = 3.0
+        self.speed = 9.0
         self.radius = 0.7
 
+    @property
+    def can_move_while_attacking(self) -> bool:
+        return True
 
 # ──────────────────────────────────────────────────────────────────────
 # Formation
 # ──────────────────────────────────────────────────────────────────────
 
 class Formation:
-    def __init__(self, units: list[Unit]):
+    def __init__(self, units: list):  # list[Unit]
         self.units = units
+        self.initial_amount = len(units)
         self.portx: float = 0.0
         self.porty: float = 0.0
         self.starboardx: float = 0.0
         self.starboardy: float = 0.0
 
-    def place_units(self):
-        dx = self.starboardx - self.portx
-        dy = self.starboardy - self.porty
-        n = len(self.units)
-        for i, unit in enumerate(self.units):
-            t = i / (n - 1) if n > 1 else 0.5
-            unit.set_x(self.portx + t * dx)
-            unit.set_y(self.porty + t * dy)
+    def _rank_positions(
+            self,
+            portx: float, porty: float,
+            starboardx: float, starboardy: float,
+            n: int,
+            rank_width: int = DEFAULT_RANK_WIDTH,
+            rank_spacing: float = DEFAULT_RANK_SPACING,
+            facing_right: bool = True,
+        ) -> list[tuple[float, float]]:
+        """
+        Compute (x, y) positions for *n* units in a ranked formation.
 
-    def move(self, portx: float, porty: float,
-             starboardx: float, starboardy: float,
-             tick_rate: int):
+        The front rank lies along the port → starboard line.
+        Subsequent ranks are placed *behind* the line (away from
+        the enemy), determined by `facing_right`.
+
+        Parameters
+        ----------
+        portx, porty, starboardx, starboardy
+            Endpoints of the front-rank line.
+        n
+            Number of units to place.
+        rank_width
+            Maximum units per rank (row width).
+        rank_spacing
+            World-unit gap between successive ranks.
+        facing_right
+            True  → enemy is to the right,  depth extends left.
+            False → enemy is to the left,   depth extends right.
+        """
+        if n == 0:
+            return []
+
         dx = starboardx - portx
         dy = starboardy - porty
-        n = len(self.units)
-        for i, unit in enumerate(self.units):
-            t = i / (n - 1) if n > 1 else 0.5
-            target_x = portx + t * dx
-            target_y = porty + t * dy
-            unit.move((target_x, target_y), tick_rate)
+        line_len = math.hypot(dx, dy)
 
-    def on_tick(self, tick_rate: int):
+        if line_len < 1e-9:
+            return [(portx, porty)] * n
+
+        # Unit vectors: along the front line
+        along_x = dx / line_len
+        along_y = dy / line_len
+
+        # Two perpendicular candidates
+        perp_a = (-along_y, along_x)
+        perp_b = (along_y, -along_x)
+
+        # Pick the one pointing away from the enemy
+        if facing_right:
+            # "Behind" is toward negative-x (our spawn side)
+            depth_dir = perp_a if perp_a[0] <= 0 else perp_b
+        else:
+            # "Behind" is toward positive-x
+            depth_dir = perp_a if perp_a[0] >= 0 else perp_b
+
+        positions: list[tuple[float, float]] = []
+        for idx in range(n):
+            rank = idx // rank_width        # row index (0 = front)
+            file_idx = idx % rank_width     # position within row
+
+            units_in_this_rank = min(rank_width, n - rank * rank_width)
+
+            # Interpolate along the front line
+            if units_in_this_rank > 1:
+                t = file_idx / (units_in_this_rank - 1)
+            else:
+                t = 0.5
+
+            front_x = portx + t * dx
+            front_y = porty + t * dy
+
+            # Offset backward by rank depth
+            x = front_x + rank * rank_spacing * depth_dir[0]
+            y = front_y + rank * rank_spacing * depth_dir[1]
+
+            positions.append((x, y))
+
+        return positions
+    
+        # ── CHANGED: place_units now uses ranks ───────────────────────
+    def place_units(
+            self,
+            rank_width: int = DEFAULT_RANK_WIDTH,
+            rank_spacing: float = DEFAULT_RANK_SPACING,
+            facing_right: bool = True,
+        ):
+        """Snap all units into rank formation at current port/starboard."""
+        positions = self._rank_positions(
+            self.portx, self.porty,
+            self.starboardx, self.starboardy,
+            len(self.units),
+            rank_width, rank_spacing, facing_right,
+        )
+        for unit, (x, y) in zip(self.units, positions):
+            unit.set_x(x)
+            unit.set_y(y)
+    
+        # ── CHANGED: move now uses ranks and updates port/starboard ───
+    def move(self, portx: float, porty: float, starboardx: float, starboardy: float,
+            rank_width: int = DEFAULT_RANK_WIDTH,
+            rank_spacing: float = DEFAULT_RANK_SPACING,
+            facing_right: bool = True,
+        ):
+        """
+        Set unit destinations along a new port/starboard line,
+        arranged in ranks.
+
+        Also updates the formation's stored port/starboard so that
+        cohesion measurement stays consistent with the target.
+        """
+        self.portx = portx
+        self.porty = porty
+        self.starboardx = starboardx
+        self.starboardy = starboardy
+
+        living = self.get_living_units()
+        positions = self._rank_positions(
+            portx, porty, starboardx, starboardy,
+            len(living),
+            rank_width, rank_spacing, facing_right,
+        )
+        for unit, (x, y) in zip(living, positions):
+            unit.set_destination(x, y)
+
+    def on_tick(self, tick_rate: int, speed_modifier: float = 1.0):
+        """Move all units one step toward their destinations."""
         for unit in self.units:
-            unit.on_tick(tick_rate)
+            unit.on_tick(tick_rate, speed_modifier)
 
-    def get_units(self) -> list[Unit]:
+    def get_units(self) -> list:
         return self.units
 
-    def get_living_units(self) -> list[Unit]:
+    def get_living_units(self) -> list:
         return [u for u in self.units if not u.is_dead()]
 
-    def get_units_around_point(self, x: float, y: float,
-                               radius: float) -> list[Unit]:
-        return [u for u in self.units
-                if math.hypot(u.get_x() - x, u.get_y() - y) <= radius]
-
-    def add_unit(self, unit: Unit, x: float, y: float):
-        unit.set_x(x)
-        unit.set_y(y)
-        self.units.append(unit)
-
-    def remove_unit(self, unit: Unit):
-        self.units.remove(unit)
+    def get_initial_amount(self) -> int:
+        return self.initial_amount
 
     def set_port(self, x: float, y: float):
         self.portx = x
@@ -203,12 +402,86 @@ class Formation:
         self.starboardx = x
         self.starboardy = y
 
-    def get_port(self) -> tuple[float, float]:
+    def get_port(self) -> tuple:
         return (self.portx, self.porty)
 
-    def get_starboard(self) -> tuple[float, float]:
+    def get_starboard(self) -> tuple:
         return (self.starboardx, self.starboardy)
 
+    def add_unit(self, unit, x: float, y: float):
+        unit.set_x(x)
+        unit.set_y(y)
+        self.units.append(unit)
+
+    def remove_unit(self, unit):
+        self.units.remove(unit)
+
+    def get_units_around_point(self, x: float, y: float,
+                               radius: float) -> list:
+        import math
+        return [u for u in self.units
+                if math.hypot(u.get_x() - x, u.get_y() - y) <= radius]
+    
+    def measure_formation_cohesion(self) -> float:
+        """
+        How close a formation's living units are to a perfect line.
+
+        Returns float in [0, 1].  1 = perfect line, 0 = total disorder.
+
+        Two components, equally weighted:
+        - perp_score:    mean perpendicular distance from the line
+        - spacing_score: how evenly units are distributed along it
+
+        Sorted projection comparison makes this robust to unit deaths.
+        """
+        living = self.get_living_units()
+        n = len(living)
+        if n <= 1:
+            return 1.0
+
+        px, py = self.get_port()
+        sx, sy = self.get_starboard()
+        ldx = sx - px
+        ldy = sy - py
+        line_len = math.hypot(ldx, ldy)
+
+        if line_len < 1e-9:
+            return 0.5
+
+        # Unit vectors: along line and normal
+        along_x = ldx / line_len
+        along_y = ldy / line_len
+        norm_x = -along_y
+        norm_y =  along_x
+
+        perp_distances = []
+        projections = []
+
+        for u in living:
+            dx = u.x - px
+            dy = u.y - py
+            t = (dx * along_x + dy * along_y) / line_len   # [0,1] ideally
+            perp = abs(dx * norm_x + dy * norm_y)
+            projections.append(t)
+            perp_distances.append(perp)
+
+        # ── Perpendicular score ───────────────────────────────────
+        mean_perp = sum(perp_distances) / n
+        # Normalise against half the line length — if mean drift equals
+        # half the formation width, cohesion is essentially gone.
+        perp_score = max(0.0, 1.0 - mean_perp / (line_len * 0.5))
+
+        # ── Spacing score ─────────────────────────────────────────
+        projections.sort()
+        ideal = [i / (n - 1) for i in range(n)]
+        spacing_error = sum(abs(projections[i] - ideal[i]) for i in range(n)) / n
+        # An average error of 0.5 (half the line) ⇒ score ~ 0
+        spacing_score = max(0.0, 1.0 - spacing_error * 2)
+
+        return (perp_score + spacing_score) / 2
+
+    def get_diagonal_length(self):
+        return math.hypot(self.starboardx - self.portx, self.starboardy - self.porty)
 
 # ──────────────────────────────────────────────────────────────────────
 # Team
@@ -253,6 +526,7 @@ class World:
         self.width = width
         self.height = height
         self.tick_rate = tick_rate
+        self.tick_count = 0
         self.curriculum_stage = curriculum_stage
 
         self.teams: list[Team] = []
@@ -437,14 +711,12 @@ class World:
     # ==================================================================
 
     def _combat_phase(self, living: list[Unit]):
-        """
-        Formation-based combat using a KDTree for nearest-enemy lookup.
+        # Clear last tick's attack flags — attack() will re-set
+        # them for units that attack this tick
+        for u in living:
+            u.is_attacking = False
 
-        Builds one KDTree per team from all living enemies, then queries
-        all attackers at once — replacing the brute-force inner loop.
-        """
         for team in self.teams:
-            # Gather ALL living enemies into a single pool
             enemy_units = []
             for et in self.teams:
                 if et.team_id == team.team_id:
@@ -455,11 +727,9 @@ class World:
             if not enemy_units:
                 continue
 
-            # One tree for all enemies this team can target
             enemy_pos = np.array([[u.x, u.y] for u in enemy_units])
             enemy_tree = cKDTree(enemy_pos)
 
-            # Gather all living attackers on this team
             attackers = []
             for f in team.get_formations():
                 attackers.extend(f.get_living_units())
@@ -468,26 +738,23 @@ class World:
                 continue
 
             attacker_pos = np.array([[u.x, u.y] for u in attackers])
-
-            # Single vectorised call: nearest enemy for every attacker
             dists, indices = enemy_tree.query(attacker_pos)
 
             for i, attacker in enumerate(attackers):
                 if attacker.is_dead():
                     continue
 
-                if dists[i] > attacker.range:
+                target = enemy_units[indices[i]]
+                if target.is_dead():
                     continue
 
-                candidate = enemy_units[indices[i]]
-                if candidate.is_dead():
-                    continue
-                if self.curriculum_stage >= 2 and not self.can_detect(attacker, candidate):
-                    continue
-                if self.curriculum_stage >= 3 and not self.has_line_of_sight(attacker, candidate):
-                    continue
+                dist = dists[i]
+                eff_range = self.get_effective_range_against(attacker, target)
 
-                attacker.attack(candidate)
+                if dist <= eff_range and self.can_target(attacker, target):
+                    attacker.attack(target)
+                elif dist <= SIGHT_RANGE and self.can_see(attacker, target):
+                    attacker.set_destination(target.x, target.y)
 
     # ==================================================================
     # Collision separation
@@ -563,13 +830,9 @@ class World:
         living = self.get_living_units()
 
         # ── movement phase ────────────────────────────────────────────
-        if self.curriculum_stage < 1:
-            for formation in self.get_all_formations():
-                formation.on_tick(self.tick_rate)
-        else:
-            for unit in living:
-                modifier = self.get_speed_modifier(unit.x, unit.y)
-                unit.on_tick(self.tick_rate, modifier)
+        for unit in living:
+            speed_mod = self.get_speed_modifier(unit.x, unit.y)
+            unit.on_tick(self.tick_rate, speed_mod)
 
         # ── collision separation ──────────────────────────────────────
         self._resolve_collisions(living)
@@ -577,30 +840,35 @@ class World:
         # ── combat phase ──────────────────────────────────────────────
         self._combat_phase(living)
 
+        self.increment_tick()
+
+    def get_tick_count(self) -> int:
+        return self.tick_count
+    
+    def increment_tick(self):
+        self.tick_count += 1
+
     # ==================================================================
     # Population
     # ==================================================================
 
-    def populate_team(self, team: Team,
-                      min_formations: int = 1, max_formations: int = 3,
-                      min_units: int = 10, max_units: int = 50):
-        num_formations = np.random.randint(min_formations, max_formations + 1)
+    def populate_team(self, team: Team):
+        """Pick a random preset and place its formations."""
+        preset = ARMY_PRESETS[np.random.randint(len(ARMY_PRESETS))]
 
+        num_formations = len(preset["formations"])
         margin = 5
         available_height = self.height - 2 * margin
         slot_height = available_height / num_formations
 
         if not team.team_id:
-            x_start, x_end = 10, 30
+            x_start, x_end = 80, 100
         else:
-            x_start, x_end = self.width - 30, self.width - 10
+            x_start, x_end = self.width - 100, self.width - 80
 
-        for i in range(num_formations):
-            unit_type = np.random.choice(list(UNIT_TYPES.keys()))
-            amount = np.random.randint(min_units, max_units + 1)
-
-            UnitClass = UNIT_TYPES[unit_type]
-            units = [UnitClass() for _ in range(amount)]
+        for i, spec in enumerate(preset["formations"]):
+            UnitClass = UNIT_TYPES[spec["type"]]
+            units = [UnitClass() for _ in range(spec["count"])]
 
             for unit in units:
                 unit.set_team(team.team_id)
@@ -694,3 +962,16 @@ class World:
         height_map = self._apply_cellular_automata(height_map, iterations=3)
         height_map[self.terrain_map == Terrain.WATER] = 0
         return height_map
+    
+    # ==================================================================
+    # Small uttility methods
+    # ==================================================================
+
+    def get_width(self) -> int:
+        return self.width
+    
+    def get_height(self) -> int:
+        return self.height
+    
+    def get_diagonal_length(self) -> float:
+        return math.hypot(self.width, self.height)

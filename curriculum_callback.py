@@ -29,10 +29,16 @@ class CurriculumSelfPlayCallback(BaseCallback):
         Highest curriculum stage.
     verbose : int
         Print transitions if >= 1.
+
+    stages:
+    0: basic movement
+    1: terrain speed modifiers
+    2: forest concealment
+    3: height + line of sight
     """
 
     def __init__(self, save_path: str = "./opponent_snapshots",
-                 promotion_threshold: float = 0.9,
+                 promotion_threshold: float = 0.7,
                  window_size: int = 100,
                  max_stage: int = 3,
                  verbose: int = 1):

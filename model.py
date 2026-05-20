@@ -6,6 +6,13 @@ from scipy.signal import convolve2d
 from scipy.spatial import cKDTree
 import math
 from abc import ABC, abstractmethod
+from line_profiler import profile
+
+
+try:
+    profile
+except NameError:
+    def profile(f): return f
 
 ARMY_PRESETS = [
     # ── Balanced compositions ──────────────────────────────────
@@ -91,6 +98,7 @@ ARMY_PRESETS = [
         ],
     },
 ]
+
 
 DEFAULT_RANK_SPACING = 2.0
 DEFAULT_UNIT_GAP = 2.0
@@ -247,15 +255,19 @@ class Archer(Unit):
         self.speed = 1.2
         self.radius = 0.5
         self.range = (self.radius*2) + 50
+        self.cooldown = 0
 
     def attack(self, target: 'Unit'):
-        if isinstance(target, Infantry):
-            if target.get_wall():
-                target.set_hp(target.get_hp() - self.damage * 0.05)
+        if self.cooldown > 0:
+            self.cooldown -= 1
+        elif self.cooldown == 0:
+            if isinstance(target, Infantry):
+                if target.get_wall():
+                    target.set_hp(target.get_hp() - self.damage * 0.05)
+                else:
+                    target.set_hp(target.get_hp() - self.damage)
             else:
                 target.set_hp(target.get_hp() - self.damage)
-        else:
-            target.set_hp(target.get_hp() - self.damage)
         
         self.is_attacking = True
 
@@ -517,6 +529,12 @@ class World:
              np.zeros((self.height, self.width), dtype=int)],
             axis=-1
         )
+        self.diagonal = math.hypot(self.width, self.height)
+
+    def get_tile(self, x: float, y: float) -> tuple[int, int, int]:
+        gx = int(np.clip(round(x), 0, self.width - 1))
+        gy = int(np.clip(round(y), 0, self.height - 1))
+        return tuple(self.tiles[gy, gx])
 
     # ==================================================================
     # Team management
@@ -546,96 +564,70 @@ class World:
                 for f in team.get_formations()]
 
     # ==================================================================
-    # Terrain queries
-    # ==================================================================
-
-    def _clamp_grid(self, x: float, y: float) -> tuple[int, int]:
-        gx = int(np.clip(round(x), 0, self.width - 1))
-        gy = int(np.clip(round(y), 0, self.height - 1))
-        return gx, gy
-
-    def get_terrain_at(self, x: float, y: float) -> int:
-        gx, gy = self._clamp_grid(x, y)
-        return int(self.terrain_map[gy, gx])
-
-    def get_height_at(self, x: float, y: float) -> int:
-        gx, gy = self._clamp_grid(x, y)
-        return int(self.height_map[gy, gx])
-
-    # ==================================================================
     # Curriculum-gated mechanics
     # ==================================================================
 
     def get_speed_modifier(self, x: float, y: float) -> float:
         if self.curriculum_stage < 1:
             return 1.0
-        terrain = self.get_terrain_at(x, y)
+        terrain = self.tiles[int(y), int(x), 0]
         return TERRAIN_SPEED.get(terrain, 1.0)
 
-    def is_concealed(self, unit: Unit) -> bool:
-        if self.curriculum_stage < 2:
-            return False
-        return self.get_terrain_at(unit.x, unit.y) == Terrain.FOREST
-
     def can_detect(self, observer: Unit, target: Unit) -> bool:
+        t_x = int(max(0, min(round(target.x), self.width - 1)))
+        t_y = int(max(0, min(round(target.y), self.height - 1)))
+
         if self.curriculum_stage < 2:
             return True
-        if not self.is_concealed(target):
+        if self.terrain_map[t_y, t_x] != 2: #check enum, 2 is forrest, int64 and enum overhead slowed this down a lot, so hard coded
             return True
-        return (math.hypot(target.x - observer.x,
-                           target.y - observer.y) <= FOREST_DETECTION_RANGE)
+        o_x = int(max(0, min(round(observer.x), self.width - 1)))
+        o_y = int(max(0, min(round(observer.y), self.height - 1)))
+        return (math.hypot(t_x - o_x, t_y - o_y) <= FOREST_DETECTION_RANGE)
 
-    def get_effective_range(self, attacker: Unit) -> float:
-        return float(attacker.range)
-
-    def get_effective_range_against(self, attacker: Unit,
-                                    target: Unit) -> float:
+    """ called alot, much overhead, commented out, i hate python
+    def get_effe!ctive_range_against(self, attacker: Unit, target: Unit) -> float:
         base = float(attacker.range)
         if self.curriculum_stage < 3:
             return base
-        h_att = self.get_height_at(attacker.x, attacker.y)
-        h_tgt = self.get_height_at(target.x, target.y)
+        a_x, a_y = self._clamp_grid(attacker.x, attacker.y)
+        t_x, t_y = self._clamp_grid(target.x, target.y)
+        h_att = self.tiles[a_y, a_x, 2]
+        h_tgt = self.tiles[t_y, t_x, 2]
         delta = (h_att - h_tgt) * HEIGHT_RANGE_BONUS_PER_LEVEL
         return max(1.0, base + delta)
+    """
 
     def has_line_of_sight(self, a: Unit, b: Unit) -> bool:
         if self.curriculum_stage < 3:
             return True
+        ax = int(max(0, min(round(a.x), self.width - 1)))
+        ay = int(max(0, min(round(a.y), self.height - 1)))
+        bx = int(max(0, min(round(b.x), self.width - 1)))
+        by = int(max(0, min(round(b.y), self.height - 1)))
 
-        ax, ay = self._clamp_grid(a.x, a.y)
-        bx, by = self._clamp_grid(b.x, b.y)
+        length = max(abs(bx - ax), abs(by - ay))
+        if length == 0:
+            return True
+        
+        dx = bx - ax
+        dy = by - ay
+        gcd = math.gcd(abs(dx), abs(dy))
 
-        h_a = self.height_map[ay, ax]
-        h_b = self.height_map[by, bx]
-        max_endpoint = max(h_a, h_b)
+        if gcd == 0:
+            return True
+        
+        step_x = dx / gcd
+        step_y = dy / gcd
 
-        for gx, gy in self._bresenham(ax, ay, bx, by):
-            if (gx, gy) == (ax, ay) or (gx, gy) == (bx, by):
-                continue
-            if self.height_map[gy, gx] > max_endpoint:
-                return False
+        for i in range(1, int(gcd)):
+            x = int(round(ax + i * step_x))
+            y = int(round(ay + i * step_y))
+            if self.height_map[y, x] > self.height_map[ay, ax] and self.height_map[y, x] > self.height_map[by, bx]:
+                return False #small features skipped, terrain smoothing should fix this, and realistically no one will engage with someone who is through a pin hole
+
         return True
-
-    @staticmethod
-    def _bresenham(x0: int, y0: int, x1: int, y1: int):
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-
-        while True:
-            yield (x0, y0)
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
-
+    
     # ==================================================================
     # Visibility
     # ==================================================================
@@ -669,7 +661,10 @@ class World:
     # ==================================================================
 
     def in_range(self, attacker: Unit, target: Unit) -> bool:
-        eff_range = self.get_effective_range_against(attacker, target)
+        ax, ay = int(max(0, min(round(attacker.x), self.width - 1))), int(max(0, min(round(attacker.y), self.height - 1)))
+        tx, ty = int(max(0, min(round(target.x),   self.width - 1))), int(max(0, min(round(target.y),   self.height - 1)))
+
+        eff_range = max(1.0, attacker.range + (self.tiles[ay, ax, 1] - self.tiles[ty, tx, 1]) * HEIGHT_RANGE_BONUS_PER_LEVEL)
         dist = math.hypot(target.x - attacker.x, target.y - attacker.y)
         return dist <= eff_range
 
@@ -720,6 +715,18 @@ class World:
             attacker_pos = np.array([[u.x, u.y] for u in attackers])
             dists, indices = enemy_tree.query(attacker_pos)
 
+            if self.curriculum_stage >= 3:
+                att_gx = np.clip(np.round(attacker_pos[:, 0]).astype(int), 0, self.width - 1)
+                att_gy = np.clip(np.round(attacker_pos[:, 1]).astype(int), 0, self.height - 1)
+                tgt_gx = np.clip(np.round(enemy_pos[indices, 0]).astype(int), 0, self.width - 1)
+                tgt_gy = np.clip(np.round(enemy_pos[indices, 1]).astype(int), 0, self.height - 1)
+                att_h = self.tiles[att_gy.astype(int), att_gx.astype(int), 1]
+                tgt_h = self.tiles[tgt_gy, tgt_gx, 1]
+                eff_ranges = np.maximum(1.0, np.array([u.range for u in attackers]) + (att_h - tgt_h) * HEIGHT_RANGE_BONUS_PER_LEVEL)
+            else:
+                eff_ranges = np.array([u.range for u in attackers])
+
+
             for i, attacker in enumerate(attackers):
                 if attacker.is_dead():
                     continue
@@ -729,11 +736,14 @@ class World:
                     continue
 
                 dist = dists[i]
-                eff_range = self.get_effective_range_against(attacker, target)
+                eff_range = eff_ranges[i]
 
                 if dist <= eff_range and self.can_target(attacker, target):
                     attacker.attack(target)
-                elif dist <= SIGHT_RANGE and self.can_see(attacker, target):
+                # After
+                elif dist <= SIGHT_RANGE:
+                    if self.curriculum_stage >= 2 and not self.can_see(attacker, target):
+                        continue
                     attacker.set_destination(target.x, target.y)
 
     # ==================================================================
@@ -951,6 +961,7 @@ class World:
         height_map[self.terrain_map == Terrain.WATER] = 0
         return height_map
     
+
     # ==================================================================
     # Small uttility methods
     # ==================================================================
@@ -960,6 +971,3 @@ class World:
     
     def get_height(self) -> int:
         return self.height
-    
-    def get_diagonal_length(self) -> float:
-        return math.hypot(self.width, self.height)

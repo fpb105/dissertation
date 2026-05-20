@@ -37,11 +37,6 @@ class BattleEnv(gym.Env):
     def __init__(self, curriculum_stage: int = 0, frame_skip: int = 1):
         super().__init__()
 
-        # ── Continuous action space ───────────────────────────────
-        # Flat vector of (port_x, port_y, star_x, star_y, shield_wall)
-        # per formation. Range [-1, 1].
-        # Positions rescaled to world coordinates in step().
-        # shield_wall: > 0 = activate, <= 0 = deactivate.
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -63,7 +58,6 @@ class BattleEnv(gym.Env):
         self.enemy_team = None
         self.current_step = 0
 
-        # ── Opponent ──────────────────────────────────────────────
         self.opponent_model = None
         self.opponent_lstm_states = None
         self.opponent_episode_start = None
@@ -84,15 +78,6 @@ class BattleEnv(gym.Env):
 
     # ── Helpers ───────────────────────────────────────────────────
     def _decode_positions(self, raw: np.ndarray) -> np.ndarray:
-        """
-        Map raw actions from [-1, 1] to world coordinates.
-
-        Input shape:  (MAX_FORMATIONS, 4)
-        Output shape: (MAX_FORMATIONS, 4) — (px, py, sx, sy) in world units
-
-        [-1, 1] → [0, 1] → [0, dimension].
-        Clamped to world bounds.
-        """
         decoded = np.empty_like(raw)
         decoded[:, 0] = (raw[:, 0] + 1.0) / 2.0 * self.world.width
         decoded[:, 1] = (raw[:, 1] + 1.0) / 2.0 * self.world.height
@@ -104,23 +89,10 @@ class BattleEnv(gym.Env):
 
     # ── Shield wall application ───────────────────────────────────
     def _apply_shield_wall(self, formations, shield_wall_raw):
-        """
-        Apply shield wall toggles and return the reward adjustment.
-
-        For each formation with living units:
-        - If shield_wall_raw[i] > 0 (toggle on):
-            - Infantry: activate wall on all units, reward += 0.5
-            - Non-infantry: ignore the action, reward -= 10.0
-        - If shield_wall_raw[i] <= 0 (toggle off):
-            - Infantry: deactivate wall on all units
-            - Non-infantry: no effect
-        """
         reward = 0.0
-
         for i, formation in enumerate(formations):
             if i >= MAX_FORMATIONS:
                 break
-
             living = formation.get_living_units()
             if not living:
                 continue
@@ -131,17 +103,14 @@ class BattleEnv(gym.Env):
             if wants_wall:
                 if is_infantry:
                     for u in living:
-                        u.set_wall(True)
+                        u.sheild_wall = True   # direct attribute, no getter overhead
                     reward += 0.5
                 else:
-                    # Penalty for attempting shield wall on non-infantry
                     reward -= 10.0
             else:
-                # Deactivate wall if infantry, no-op otherwise
                 if is_infantry:
                     for u in living:
-                        u.set_wall(False)
-
+                        u.sheild_wall = False
         return reward
 
     # ── Reset ─────────────────────────────────────────────────────
@@ -170,10 +139,7 @@ class BattleEnv(gym.Env):
 
     # ── Step ──────────────────────────────────────────────────────
     def step(self, action):
-        # (MAX_FORMATIONS * 5,) → (MAX_FORMATIONS, 5)
         raw = action.reshape(MAX_FORMATIONS, ACTIONS_PER_FORMATION)
-
-        # Separate position columns from shield wall column
         positions = self._decode_positions(raw[:, :4])
         shield_wall_raw = raw[:, 4]
 
@@ -181,28 +147,20 @@ class BattleEnv(gym.Env):
         terminated = False
         truncated = False
 
-        # ── Shield wall: apply once per step, not per frame-skip tick ─
         friendly_formations = self.friendly_team.get_formations()
-        shield_reward = self._apply_shield_wall(
-            friendly_formations, shield_wall_raw,
-        )
+        shield_reward = self._apply_shield_wall(friendly_formations, shield_wall_raw)
         total_reward += shield_reward
 
         for _ in range(self.frame_skip):
-            # ── Friendly: set formation targets ───────────────────
             for i, formation in enumerate(friendly_formations):
                 if i >= MAX_FORMATIONS:
                     break
                 if not formation.get_living_units():
                     continue
-
                 px, py, sx, sy = positions[i]
                 formation.move(px, py, sx, sy)
 
-            # ── Opponent acts ─────────────────────────────────────
             self._opponent_act()
-
-            # ── Simulation tick ───────────────────────────────────
             self.world.tick()
             self.current_step += 1
 
@@ -230,19 +188,14 @@ class BattleEnv(gym.Env):
         enemy_formations = self.enemy_team.get_formations()
 
         if self.opponent_model is None:
-            # Scripted: slide each formation's target toward the player
             advance_step = SCRIPTED_ADVANCE_SPEED / self.tick_rate
             for formation in enemy_formations:
                 if not formation.get_living_units():
                     continue
                 px, py = formation.get_port()
                 sx, sy = formation.get_starboard()
-                formation.move(
-                    px - advance_step, py,
-                    sx - advance_step, sy,
-                )
+                formation.move(px - advance_step, py, sx - advance_step, sy)
         else:
-            # Self-play: query frozen policy with mirrored obs
             opponent_obs = self._build_opponent_obs()
             obs_batch = np.expand_dims(opponent_obs, axis=0)
 
@@ -261,7 +214,6 @@ class BattleEnv(gym.Env):
             positions = self._decode_positions(raw[:, :4])
             enemy_shield_wall_raw = raw[:, 4]
 
-            # Apply shield wall for opponent infantry (no reward tracking)
             for i, formation in enumerate(enemy_formations):
                 if i >= MAX_FORMATIONS:
                     break
@@ -269,55 +221,42 @@ class BattleEnv(gym.Env):
                 if not living:
                     continue
 
-                # Shield wall for opponent infantry
                 if isinstance(living[0], model.Infantry):
                     wall_on = enemy_shield_wall_raw[i] > 0.0
                     for u in living:
-                        u.set_wall(wall_on)
+                        u.sheild_wall = wall_on   # direct attribute
 
                 px, py, sx, sy = positions[i]
-                # Mirror x: the opponent's policy sees a mirrored world
                 px = self.world.width - px
                 sx = self.world.width - sx
-                formation.move(
-                    px, py, sx, sy,
-                )
+                formation.move(px, py, sx, sy)
 
     def _build_opponent_obs(self) -> np.ndarray:
         obs = np.zeros(OBS_SIZE, dtype=np.float32)
         self._encode_team_formations(
-            obs, self.enemy_team.get_formations(),
-            offset=0, mirror_x=True,
+            obs, self.enemy_team.get_formations(), offset=0, mirror_x=True,
         )
         self._encode_team_formations(
             obs, self.friendly_team.get_formations(),
-            offset=MAX_FORMATIONS * FEATURES_PER_FORMATION,
-            mirror_x=True,
+            offset=MAX_FORMATIONS * FEATURES_PER_FORMATION, mirror_x=True,
         )
-        self._encode_global_features(
-            obs, offset=MAX_FORMATIONS * FEATURES_PER_FORMATION * 2,
-        )
+        self._encode_global_features(obs, offset=MAX_FORMATIONS * FEATURES_PER_FORMATION * 2)
         return obs
 
     # ── Observation builder ───────────────────────────────────────
     def _build_obs(self) -> np.ndarray:
         obs = np.zeros(OBS_SIZE, dtype=np.float32)
         self._encode_team_formations(
-            obs, self.friendly_team.get_formations(),
-            offset=0, mirror_x=False,
+            obs, self.friendly_team.get_formations(), offset=0, mirror_x=False,
         )
         self._encode_team_formations(
             obs, self.enemy_team.get_formations(),
-            offset=MAX_FORMATIONS * FEATURES_PER_FORMATION,
-            mirror_x=False,
+            offset=MAX_FORMATIONS * FEATURES_PER_FORMATION, mirror_x=False,
         )
-        self._encode_global_features(
-            obs, offset=MAX_FORMATIONS * FEATURES_PER_FORMATION * 2,
-        )
+        self._encode_global_features(obs, offset=MAX_FORMATIONS * FEATURES_PER_FORMATION * 2)
         return obs
 
-    def _encode_team_formations(self, obs, formations, offset,
-                                 mirror_x=False):
+    def _encode_team_formations(self, obs, formations, offset, mirror_x=False):
         for i, formation in enumerate(formations):
             if i >= MAX_FORMATIONS:
                 break
@@ -326,14 +265,13 @@ class BattleEnv(gym.Env):
                 continue
 
             base = offset + (i * FEATURES_PER_FORMATION)
-            unit_type_name = UNIT_CLASS_TO_TYPE.get(
-                type(living[0]), "infantry"
-            )
+            unit_type_name = UNIT_CLASS_TO_TYPE.get(type(living[0]), "infantry")
 
-            xs = [u.get_x() for u in living]
-            ys = [u.get_y() for u in living]
-            avg_x = sum(xs) / len(xs)
-            avg_y = sum(ys) / len(ys)
+            xs = [u.x for u in living]
+            ys = [u.y for u in living]
+            n = len(xs)
+            avg_x = sum(xs) / n
+            avg_y = sum(ys) / n
             min_x = min(xs)
             max_x = max(xs)
             min_y = min(ys)
@@ -341,72 +279,53 @@ class BattleEnv(gym.Env):
 
             if mirror_x:
                 avg_x = self.world.width - avg_x
-                min_x, max_x = (
-                    self.world.width - max_x,
-                    self.world.width - min_x,
-                )
+                min_x, max_x = self.world.width - max_x, self.world.width - min_x
 
-            obs[base + 0] = 1.0                                        # alive
-            obs[base + 1] = UNIT_TYPE_ENCODING.get(unit_type_name, 0.0) # type
-            obs[base + 2] = min(len(living) / 50.0, 1.0)               # count
-            obs[base + 3] = min_x / self.world.width                    # left edge
-            obs[base + 4] = max_x / self.world.width                    # right edge
-            obs[base + 5] = avg_y / self.world.height                   # vertical pos
-            obs[base + 6] = self.world.get_height_at(avg_x, avg_y) / 5.0
-            obs[base + 7] = self.world.get_terrain_at(avg_x, avg_y) / 2.0
-            # Shield wall status
+            gx = int(max(0, min(round(avg_x), self.world.width - 1)))
+            gy = int(max(0, min(round(avg_y), self.world.height - 1)))
+
+            obs[base + 0]  = 1.0
+            obs[base + 1]  = UNIT_TYPE_ENCODING.get(unit_type_name, 0.0)
+            obs[base + 2]  = min(n / 50.0, 1.0)
+            obs[base + 3]  = min_x / self.world.width
+            obs[base + 4]  = max_x / self.world.width
+            obs[base + 5]  = avg_y / self.world.height
+            obs[base + 6]  = self.world.tiles[gy, gx, 1] / 5.0   # height
+            obs[base + 7]  = self.world.tiles[gy, gx, 0] / 2.0   # terrain
             if unit_type_name == "infantry":
-                # Check first living unit — all units in a formation share type
-                shield_active = living[0].get_wall()
-                obs[base + 8] = 1.0 if shield_active else 0.5
+                obs[base + 8] = 1.0 if living[0].sheild_wall else 0.5  # direct attribute
             else:
                 obs[base + 8] = 0.0
-            obs[base + 9] = max_y / self.world.height 
-            obs[base + 10] = min_y / self.world.height  
+            obs[base + 9]  = max_y / self.world.height
+            obs[base + 10] = min_y / self.world.height
             obs[base + 11] = avg_x / self.world.width
-            obs[base + 12] = formation.get_rank_count() / self.world.get_diagonal_length()
-            obs[base + 13] = formation.get_rank_width() / self.world.get_diagonal_length()
+            obs[base + 12] = formation.get_rank_count() / self.world.diagonal
+            obs[base + 13] = formation.get_rank_width() / self.world.diagonal
 
     def _encode_global_features(self, obs, offset):
         obs[offset + 0] = self.current_step / MAX_STEPS
-        obs[offset + 1] = self.world.get_width() / 1000.0
-        obs[offset + 2] = self.world.get_height() / 1000.0
+        obs[offset + 1] = self.world.width / 1000.0
+        obs[offset + 2] = self.world.height / 1000.0
 
     # ── Reward ────────────────────────────────────────────────────
     def _total_hp(self, team) -> int:
-        return sum(u.get_hp() for u in team.get_living_units())
+        # FIX: was u.health (AttributeError), correct attribute is u.hp
+        return sum(u.hp for u in team.get_living_units())
 
     def _avg_distance_to_enemy(self) -> float:
-        friendly_formations = self.friendly_team.get_formations()
-        enemy_formations = self.enemy_team.get_formations()
+        # Simplified from O(f²) formation pairs to O(n) army centroid comparison
+        friendly_living = self.friendly_team.get_living_units()
+        enemy_living = self.enemy_team.get_living_units()
 
-        friendly_centres = []
-        for f in friendly_formations:
-            living = f.get_living_units()
-            if living:
-                cx = sum(u.get_x() for u in living) / len(living)
-                cy = sum(u.get_y() for u in living) / len(living)
-                friendly_centres.append((cx, cy))
-
-        enemy_centres = []
-        for f in enemy_formations:
-            living = f.get_living_units()
-            if living:
-                cx = sum(u.get_x() for u in living) / len(living)
-                cy = sum(u.get_y() for u in living) / len(living)
-                enemy_centres.append((cx, cy))
-
-        if not friendly_centres or not enemy_centres:
+        if not friendly_living or not enemy_living:
             return 0.0
 
-        total = 0.0
-        count = 0
-        for fx, fy in friendly_centres:
-            for ex, ey in enemy_centres:
-                total += math.hypot(fx - ex, fy - ey)
-                count += 1
+        fx = sum(u.x for u in friendly_living) / len(friendly_living)
+        fy = sum(u.y for u in friendly_living) / len(friendly_living)
+        ex = sum(u.x for u in enemy_living) / len(enemy_living)
+        ey = sum(u.y for u in enemy_living) / len(enemy_living)
 
-        return total / count if count else 0.0
+        return math.hypot(fx - ex, fy - ey)
 
     def _compute_reward(self) -> float:
         """Reward components:
@@ -417,48 +336,63 @@ class BattleEnv(gym.Env):
         """
         reward = 0.0
 
+        # Compute living units once per formation — reused across all reward components
+        friendly_living_by_formation = [
+            f.get_living_units() for f in self.friendly_team.get_formations()
+        ]
+        enemy_living_by_formation = [
+            f.get_living_units() for f in self.enemy_team.get_formations()
+        ]
+
         # ── 1. HP differential ────────────────────────────────────
-        current_friendly_hp = self._total_hp(self.friendly_team)
-        current_enemy_hp = self._total_hp(self.enemy_team)
+        current_friendly_hp = sum(
+            u.hp for living in friendly_living_by_formation for u in living
+        )
+        current_enemy_hp = sum(
+            u.hp for living in enemy_living_by_formation for u in living
+        )
 
         friendly_hp_lost = self.prev_friendly_hp - current_friendly_hp
-        enemy_hp_lost = self.prev_enemy_hp - current_enemy_hp
+        enemy_hp_lost    = self.prev_enemy_hp    - current_enemy_hp
 
         hp_scale = max(self.prev_friendly_hp + self.prev_enemy_hp, 1)
-        reward += enemy_hp_lost / hp_scale * 0.5
+        reward += enemy_hp_lost    / hp_scale * 0.5
         reward -= friendly_hp_lost / hp_scale * 0.1
 
         self.prev_friendly_hp = current_friendly_hp
-        self.prev_enemy_hp = current_enemy_hp
+        self.prev_enemy_hp    = current_enemy_hp
 
         # ── 2. Approach reward ────────────────────────────────────
-        avg_distance = self._avg_distance_to_enemy()
-        max_distance = self.world.get_diagonal_length()
+        avg_distance   = self._avg_distance_to_enemy()
         distance_closed = self.prev_avg_distance - avg_distance
-        reward += distance_closed / max_distance * 2.0
+        # Use cached diagonal — avoids math.hypot call every tick
+        reward += distance_closed / self.world.diagonal * 2.0
         self.prev_avg_distance = avg_distance
 
         # ── 3. Cohesion ───────────────────────────────────────────
-        for formation in self.friendly_team.get_formations():
-            living = formation.get_living_units()
+        for living in friendly_living_by_formation:
             if not living:
                 continue
+            # Find the formation for cohesion metrics — match by first unit
+            formation = next(
+                f for f in self.friendly_team.get_formations()
+                if f.get_living_units() and f.get_living_units()[0] is living[0]
+            )
             cohesion = formation.measure_formation_cohesion()
-            # Peak reward at 0.7, falls off symmetrically
             cohesion_reward = max(0.0, 1.0 - abs(cohesion - 0.7) / 0.3)
             reward += cohesion_reward * 0.5
-            # penalise diagonals: expected length vs actual
+
             n = len(living)
-            unit_slot = 2 * living[0].get_radius() + model.DEFAULT_UNIT_GAP
+            unit_slot = 2 * living[0].radius + model.DEFAULT_UNIT_GAP  # direct attribute
             expected_len = n * unit_slot
             actual_len = formation.get_diagonal_length()
             if actual_len > expected_len * 2.0:
-                reward -= 1  # per formation, per tick — adds up fast
+                reward -= 1.0
 
         # ── 4. Terminal bonuses ───────────────────────────────────
-        if self.enemy_team.is_defeated():
+        if not any(living for living in enemy_living_by_formation):
             reward += 10.0
-        elif self.friendly_team.is_defeated():
+        elif not any(living for living in friendly_living_by_formation):
             reward -= 10.0
 
         return reward

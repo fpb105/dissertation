@@ -8,11 +8,13 @@ Controls:
     ESC    - quit
 """
 
+import math
 import tkinter as tk
 import numpy as np
 from sb3_contrib import RecurrentPPO
 from model import World, Team, Infantry
 from view import WorldView
+from line_profiler import profile
 from gym_wrapper import (
     BattleEnv, MAX_FORMATIONS, FEATURES_PER_FORMATION,
     ACTIONS_PER_FORMATION, OBS_SIZE, NUM_GLOBAL_FEATURES,
@@ -56,7 +58,7 @@ class AgentController:
         self.running = not self.running
         if self.running:
             self._loop()
-
+    @profile
     def step(self):
         self.running = False
         self._do_tick()
@@ -75,7 +77,7 @@ class AgentController:
         return decoded
 
     # ── Observation builders (matching battle_env exactly) ─────────
-
+    @profile
     def _encode_formations(self, obs, formations, offset, mirror_x=False):
         for i, formation in enumerate(formations):
             if i >= MAX_FORMATIONS:
@@ -87,8 +89,8 @@ class AgentController:
             base = offset + (i * FEATURES_PER_FORMATION)
             unit_type_name = UNIT_CLASS_TO_TYPE.get(type(living[0]), "infantry")
 
-            xs = [u.get_x() for u in living]
-            ys = [u.get_y() for u in living]
+            xs = [u.x for u in living]
+            ys = [u.y for u in living]
             avg_x = sum(xs) / len(xs)
             avg_y = sum(ys) / len(ys)
             min_x = min(xs)
@@ -106,8 +108,10 @@ class AgentController:
             obs[base + 3] = min_x / self.world.width
             obs[base + 4] = max_x / self.world.width
             obs[base + 5] = avg_y / self.world.height
-            obs[base + 6] = self.world.get_height_at(avg_x, avg_y) / 5.0
-            obs[base + 7] = self.world.get_terrain_at(avg_x, avg_y) / 2.0
+            gx = int(max(0, min(round(avg_x), self.world.width - 1)))
+            gy = int(max(0, min(round(avg_y), self.world.height - 1)))
+            obs[base + 6] = self.world.tiles[gy, gx, 1] / 5.0  # height
+            obs[base + 7] = self.world.tiles[gy, gx, 0] / 2.0  # terrain
             # Shield wall status
             if unit_type_name == "infantry":
                 shield_active = living[0].get_wall()
@@ -117,14 +121,16 @@ class AgentController:
             obs[base + 9] = max_y / self.world.height
             obs[base + 10] = min_y / self.world.height
             obs[base + 11] = avg_x / self.world.width
-            obs[base + 12] = formation.get_rank_count() / self.world.get_diagonal_length()
-            obs[base + 13] = formation.get_rank_width() / self.world.get_diagonal_length()
+            obs[base + 12] = formation.get_rank_count() / world.diagonal
+            obs[base + 13] = formation.get_rank_width() / world.diagonal
 
+    @profile
     def _encode_global_features(self, obs, offset):
         obs[offset + 0] = self.tick_count / MAX_STEPS
-        obs[offset + 1] = self.world.get_width() / 1000.0
-        obs[offset + 2] = self.world.get_height() / 1000.0
+        obs[offset + 1] = self.world.width / 1000.0
+        obs[offset + 2] = self.world.height / 1000.0
 
+    @profile
     def _build_obs(self) -> np.ndarray:
         obs = np.zeros(OBS_SIZE, dtype=np.float32)
         self._encode_formations(obs, self.friendly.get_formations(), offset=0)
@@ -175,6 +181,7 @@ class AgentController:
 
         return positions, shield_wall_raw
 
+    @profile
     def _do_tick(self):
         # ── Friendly agent decides ─────────────────────────────────
         obs = self._build_obs()
@@ -211,51 +218,7 @@ class AgentController:
         e_positions, e_shields = self._apply_actions(
             enemy_action, enemy_formations, facing_right=False,
         )
-
-        # ── Log ────────────────────────────────────────────────────
-        f_info = []
-        for i, f in enumerate(friendly_formations):
-            living = f.get_living_units()
-            if living:
-                ax = sum(u.get_x() for u in living) / len(living)
-                ay = sum(u.get_y() for u in living) / len(living)
-                px, py, sx, sy = f_positions[i]
-                type_name = UNIT_CLASS_TO_TYPE.get(type(living[0]), "?")
-                wall_str = ""
-                if isinstance(living[0], Infantry):
-                    wall_str = " [WALL]" if f_shields[i] > 0 else ""
-                f_info.append(
-                    f"{type_name} pos=({ax:.0f},{ay:.0f}) → "
-                    f"target=({px:.0f},{py:.0f})-({sx:.0f},{sy:.0f}){wall_str}"
-                )
-            else:
-                f_info.append("(dead)")
-
-        e_info = []
-        for i, f in enumerate(enemy_formations):
-            living = f.get_living_units()
-            if living:
-                ax = sum(u.get_x() for u in living) / len(living)
-                ay = sum(u.get_y() for u in living) / len(living)
-                px, py = f.get_port()
-                sx, sy = f.get_starboard()
-                type_name = UNIT_CLASS_TO_TYPE.get(type(living[0]), "?")
-                wall_str = ""
-                if isinstance(living[0], Infantry):
-                    wall_str = " [WALL]" if e_shields[i] > 0 else ""
-                e_info.append(
-                    f"{type_name} pos=({ax:.0f},{ay:.0f}) → "
-                    f"target=({px:.0f},{py:.0f})-({sx:.0f},{sy:.0f}){wall_str}"
-                )
-            else:
-                e_info.append("(dead)")
-
-        print(f"Tick {self.tick_count:4d}")
-        for i, info in enumerate(f_info):
-            print(f"  F{i}: {info}")
-        for i, info in enumerate(e_info):
-            print(f"  E{i}: {info}")
-
+        
         # ── Advance simulation ────────────────────────────────────
         self.world.tick()
         self.tick_count += 1

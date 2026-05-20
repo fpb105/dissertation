@@ -21,12 +21,14 @@ if __name__ == "__main__":
         env=env,
         device="cuda",
         custom_objects={
-            "learning_rate": 5e-5,
+            "learning_rate": 1e-3,  # increase learning rate for fine-tuning
+                "clip_range": 0.2,     # PPO clipping parameter
+                    "n_epochs": 10,       # more epochs per update
         },
     )
 
     checkpoint_callback = CheckpointCallback(
-        save_freq=1_000_000,
+        save_freq=5_000_000, #may not be used
         save_path="./checkpoints/",
         name_prefix="battle_sim"
     )
@@ -47,5 +49,5 @@ if __name__ == "__main__":
         reset_num_timesteps=False,  # keeps tensorboard continuous
     )
 
-    model.save("battle_agent_ultra_finetuned.zip")
+    model.save("battle_agent_ultra_ultra_mega_finetuned.zip")
     print("Fine-tuning complete.")
